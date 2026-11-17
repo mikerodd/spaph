@@ -148,6 +148,18 @@ impl SpaphPluginInstance for Vst3Instance {
             if let Ok(mut p) = self.plugin.lock() {
                 p.service_run_loop();
             }
+            // Pump the Windows message queue so the plugin's editor (and any child
+            // windows such as login dialogs) can receive input and paint.
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use winapi::um::winuser::{PeekMessageW, TranslateMessage, DispatchMessageW, PM_REMOVE};
+                use winapi::um::winuser::MSG;
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         window.close();
