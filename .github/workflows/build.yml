@@ -11,7 +11,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -29,7 +29,7 @@ jobs:
           mkdir -p dist
           cp target/release/spaph dist/
           cd dist && tar czf ../spaph-linux-x86_64.tar.gz spaph
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: spaph-linux-x86_64
           path: spaph-linux-x86_64.tar.gz
@@ -37,7 +37,7 @@ jobs:
   linux-pipewire:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -55,7 +55,7 @@ jobs:
           mkdir -p dist
           cp target/release/spaph dist/
           cd dist && tar czf ../spaph-linux-x86_64-pipewire.tar.gz spaph
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: spaph-linux-x86_64-pipewire
           path: spaph-linux-x86_64-pipewire.tar.gz
@@ -63,7 +63,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -80,7 +80,7 @@ jobs:
           mkdir -p dist
           cp target/x86_64-pc-windows-msvc/release/spaph.exe dist/
           cd dist && 7z a ../spaph-windows-x86_64.zip spaph.exe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: spaph-windows-x86_64
           path: spaph-windows-x86_64.zip
