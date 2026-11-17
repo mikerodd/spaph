@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # spaph — Simple Portable Audio Plugins Host
 
 GPLv3 CLI host for VST2/VST3 (and later CLAP) audio plugins, with OSC remote control.
@@ -24,3 +25,7 @@ Native PipeWire support is enabled by default and requires `libpipewire-dev` + `
 ./target/debug/spaph
 spaph> help
 ```
+=======
+# spaph
+the Simple Portable Audio Plugins Host
+>>>>>>> origin/main
