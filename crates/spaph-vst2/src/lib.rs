@@ -185,6 +185,20 @@ impl SpaphPluginInstance for Vst2Instance {
         self.load_state(&data)
     }
 
+    fn has_editor(&self) -> bool {
+        false
+    }
+
+    fn open_editor(&mut self) -> Result<()> {
+        Err(SpaphError::Plugin("VST2 editor not supported yet".into()))
+    }
+
+    fn save_preset_file(&self, path: &std::path::Path) -> Result<()> {
+        let data = self.save_state()?;
+        std::fs::write(path, data).map_err(|e| SpaphError::Plugin(e.to_string()))?;
+        Ok(())
+    }
+
     fn get_param(&self, index: u32) -> f64 {
         self.params.get_parameter(index as i32) as f64
     }

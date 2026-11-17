@@ -53,8 +53,17 @@ pub trait PluginInstance: Send {
     fn select_preset(&mut self, _index: usize) -> Result<()> {
         Ok(())
     }
+    fn has_editor(&self) -> bool {
+        false
+    }
+    fn open_editor(&mut self) -> Result<()> {
+        Err(SpaphError::Plugin("editor not supported".into()))
+    }
     fn load_preset_file(&mut self, _path: &Path) -> Result<()> {
         Err(SpaphError::Plugin("preset file loading not supported".into()))
+    }
+    fn save_preset_file(&self, _path: &Path) -> Result<()> {
+        Err(SpaphError::Plugin("preset file saving not supported".into()))
     }
     fn get_param(&self, index: u32) -> f64;
     fn set_param(&mut self, index: u32, value: f64);

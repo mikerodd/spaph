@@ -69,6 +69,7 @@ enum Commands {
     },
     Shell,
     Unload { id: u32 },
+    Show { plugin_id: u32 },
     Select { plugin_id: u32, preset_id: u32 },
     Connect {
         #[command(subcommand)]
@@ -115,6 +116,7 @@ enum ParamAction {
 enum PresetAction {
     Scan { dir: PathBuf },
     Load { plugin_id: u32, file: PathBuf },
+    Save { plugin_id: u32, file: PathBuf },
 }
 
 fn split_args(line: &str) -> Vec<String> {
@@ -163,6 +165,7 @@ fn print_help() {
     println!("  list audio                    List audio output devices");
     println!("  midi listen <port>            Capture MIDI input (index or name), Enter to stop");
     println!("  unload <id>                   Unload a plugin by id");
+    println!("  show <plugin_id>              Show plugin editor UI (VST3)");
     println!("  select <plugin_id> <preset_id> Select a preset (1-based)");
     println!("  connect audio <id> [dev]      Connect plugin output to an audio device");
     println!("  connect midi <port> <id>      Connect a MIDI input to a plugin");
@@ -172,6 +175,7 @@ fn print_help() {
     println!("  param set <id> <idx|volume> <value>  Set a parameter or volume");
     println!("  preset scan <dir>             Scan a directory for preset files");
     println!("  preset load <id> <file>       Load a preset file into a plugin");
+    println!("  preset save <id> <file>       Save current state as preset file");
     println!("  disconnect                    Stop audio and MIDI connections");
     println!("  quit | exit                   Exit the shell");
 }
@@ -609,9 +613,30 @@ fn run_line(line: &str) -> bool {
         }
         "preset" => {
             if parts.len() < 2 {
-                eprintln!("usage: preset <scan|load> ...");
+                eprintln!("usage: preset <scan|load|save> ...");
             } else {
                 match parts[1].as_str() {
+                    "save" => {
+                        if parts.len() < 4 {
+                            eprintln!("usage: preset save <plugin_id> <file>");
+                        } else if let Ok(pid) = parts[2].parse::<u32>() {
+                            let file = PathBuf::from(&parts[3]);
+                            let mgr = manager().lock().unwrap();
+                            let inst = mgr.get_instance(pid);
+                            drop(mgr);
+                            if let Some(inst) = inst {
+                                let inst = inst.lock().unwrap();
+                                match inst.save_preset_file(&file) {
+                                    Ok(_) => println!("saved preset {}", file.display()),
+                                    Err(e) => eprintln!("error: {}", e),
+                                }
+                            } else {
+                                eprintln!("plugin {} not found", pid);
+                            }
+                        } else {
+                            eprintln!("invalid plugin id");
+                        }
+                    }
                     "scan" => {
                         if parts.len() < 3 {
                             eprintln!("usage: preset scan <dir>");
@@ -643,6 +668,30 @@ fn run_line(line: &str) -> bool {
                     }
                     other => eprintln!("unknown preset action: {}", other),
                 }
+            }
+        }
+        "show" => {
+            if parts.len() < 2 {
+                eprintln!("usage: show <plugin_id>");
+            } else if let Ok(pid) = parts[1].parse::<u32>() {
+                let mgr = manager().lock().unwrap();
+                let inst = mgr.get_instance(pid);
+                drop(mgr);
+                if let Some(inst) = inst {
+                    let mut inst = inst.lock().unwrap();
+                    if !inst.has_editor() {
+                        eprintln!("plugin {} has no editor", pid);
+                    } else {
+                        println!("opening editor for plugin {} (close window to continue)", pid);
+                        if let Err(e) = inst.open_editor() {
+                            eprintln!("error: {}", e);
+                        }
+                    }
+                } else {
+                    eprintln!("plugin {} not found", pid);
+                }
+            } else {
+                eprintln!("invalid plugin id");
             }
         }
         "quit" | "exit" => return false,
@@ -935,6 +984,44 @@ fn main() {
                     eprintln!("plugin {} not found", plugin_id);
                     std::process::exit(1);
                 }
+            }
+            PresetAction::Save { plugin_id, file } => {
+                let mgr = manager().lock().unwrap();
+                let inst = mgr.get_instance(plugin_id);
+                drop(mgr);
+                if let Some(inst) = inst {
+                    let inst = inst.lock().unwrap();
+                    match inst.save_preset_file(&file) {
+                        Ok(_) => println!("saved preset {}", file.display()),
+                        Err(e) => {
+                            eprintln!("error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    eprintln!("plugin {} not found", plugin_id);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::Show { plugin_id }) => {
+            let mgr = manager().lock().unwrap();
+            let inst = mgr.get_instance(plugin_id);
+            drop(mgr);
+            if let Some(inst) = inst {
+                let mut inst = inst.lock().unwrap();
+                if !inst.has_editor() {
+                    eprintln!("plugin {} has no editor", plugin_id);
+                    std::process::exit(1);
+                }
+                println!("opening editor for plugin {} (close window to continue)", plugin_id);
+                if let Err(e) = inst.open_editor() {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("plugin {} not found", plugin_id);
+                std::process::exit(1);
             }
         }
         Some(Commands::Unload { id }) => {

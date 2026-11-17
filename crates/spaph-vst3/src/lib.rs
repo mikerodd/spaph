@@ -60,6 +60,7 @@ impl PluginFactory for Vst3Factory {
             params: param_infos,
             presets: preset_names,
         };
+        let plugin = std::sync::Arc::new(std::sync::Mutex::new(plugin));
         Ok(Box::new(Vst3Instance {
             info,
             plugin,
@@ -70,7 +71,7 @@ impl PluginFactory for Vst3Factory {
 
 pub struct Vst3Instance {
     info: SpaphPluginInfo,
-    plugin: Vst3Plugin,
+    plugin: std::sync::Arc<std::sync::Mutex<Vst3Plugin>>,
     presets_map: Vec<(i32, i32)>,
 }
 
@@ -82,13 +83,13 @@ impl SpaphPluginInstance for Vst3Instance {
     }
     fn set_sample_rate(&mut self, _sr: f64) {}
     fn init(&mut self) {
-        let _ = self.plugin.start_processing();
+        let _ = self.plugin.lock().unwrap().start_processing();
     }
     fn activate(&mut self) -> Result<()> {
-        self.plugin.start_processing().map_err(|e| SpaphError::Plugin(e.to_string()))
+        self.plugin.lock().unwrap().start_processing().map_err(|e| SpaphError::Plugin(e.to_string()))
     }
     fn deactivate(&mut self) {
-        let _ = self.plugin.stop_processing();
+        let _ = self.plugin.lock().unwrap().stop_processing();
     }
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], num_frames: usize) {
         let sr = 44100.0;
@@ -100,7 +101,7 @@ impl SpaphPluginInstance for Vst3Instance {
                 }
             }
         }
-        let _ = self.plugin.process_audio(&mut bufs);
+        let _ = self.plugin.lock().unwrap().process_audio(&mut bufs);
         for (i, ch) in outputs.iter_mut().enumerate() {
             if i < bufs.outputs.len() {
                 for (j, s) in ch.iter_mut().enumerate().take(num_frames) {
@@ -110,7 +111,7 @@ impl SpaphPluginInstance for Vst3Instance {
         }
     }    fn handle_midi(&mut self, event: &MidiEvent) {
         if let Some(me) = vst3_host::midi::MidiEvent::from_midi_bytes(&event.data) {
-            let _ = self.plugin.send_live_midi_event(me);
+            let _ = self.plugin.lock().unwrap().send_live_midi_event(me);
         }
     }    fn preset_name(&self, index: usize) -> Option<String> {
         self.info.presets.get(index).cloned()
@@ -120,30 +121,53 @@ impl SpaphPluginInstance for Vst3Instance {
             return Err(SpaphError::Plugin("preset index out of range".into()));
         }
         let (unit_id, prog_idx) = self.presets_map[index];
-        self.plugin.select_program(unit_id, prog_idx).map_err(|e| SpaphError::Plugin(e.to_string()))
+        self.plugin.lock().unwrap().select_program(unit_id, prog_idx).map_err(|e| SpaphError::Plugin(e.to_string()))
     }
     fn load_preset_file(&mut self, path: &Path) -> Result<()> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         if ext == "vstpreset" {
-            self.plugin.load_vstpreset(path).map_err(|e| SpaphError::Plugin(e.to_string()))
+            self.plugin.lock().unwrap().load_vstpreset(path).map_err(|e| SpaphError::Plugin(e.to_string()))
         } else if ext == "fxp" || ext == "fxb" {
             Err(SpaphError::Plugin(".fxp/.fxb is VST2 format and cannot be loaded into a VST3 plugin via host state API".into()))
         } else {
             let data = std::fs::read(path).map_err(|e| SpaphError::Plugin(e.to_string()))?;
-            self.plugin.load_state(&data).map_err(|e| SpaphError::Plugin(e.to_string()))
+            self.plugin.lock().unwrap().load_state(&data).map_err(|e| SpaphError::Plugin(e.to_string()))
         }
     }
 
+    fn has_editor(&self) -> bool {
+        self.plugin.lock().unwrap().has_editor()
+    }
+
+    fn open_editor(&mut self) -> Result<()> {
+        use vst3_host::window::PluginWindow;
+        let mut window = PluginWindow::new(self.plugin.clone());
+        window.open().map_err(|e| SpaphError::Plugin(e.to_string()))?;
+        while !window.closed_by_user() {
+            let _ = window.service_platform_events();
+            if let Ok(mut p) = self.plugin.lock() {
+                p.service_run_loop();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        window.close();
+        Ok(())
+    }
+
+    fn save_preset_file(&self, path: &Path) -> Result<()> {
+        self.plugin.lock().unwrap().save_vstpreset(path).map_err(|e| SpaphError::Plugin(e.to_string()))
+    }
+
     fn get_param(&self, index: u32) -> f64 {
-        self.plugin.get_parameter(index).unwrap_or(0.0)
+        self.plugin.lock().unwrap().get_parameter(index).unwrap_or(0.0)
     }
     fn set_param(&mut self, index: u32, value: f64) {
-        let _ = self.plugin.set_parameter(index, value);
+        let _ = self.plugin.lock().unwrap().set_parameter(index, value);
     }
     fn save_state(&self) -> Result<Vec<u8>> {
-        self.plugin.save_state().map_err(|e| SpaphError::Plugin(e.to_string()))
+        self.plugin.lock().unwrap().save_state().map_err(|e| SpaphError::Plugin(e.to_string()))
     }
     fn load_state(&mut self, data: &[u8]) -> Result<()> {
-        self.plugin.load_state(data).map_err(|e| SpaphError::Plugin(e.to_string()))
+        self.plugin.lock().unwrap().load_state(data).map_err(|e| SpaphError::Plugin(e.to_string()))
     }
 }
