@@ -113,3 +113,22 @@ fn missing_explicit_config_exits_with_message() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("/definitely/not/here.json"));
 }
+
+#[test]
+fn connect_audio_with_unknown_plugin_id_reports_error_without_panic() {
+    // Regression: `connect audio 0 1` (id 0 does not exist) used to panic.
+    let dir = scratch("badid");
+    std::fs::write(dir.join("s.spaph"), "connect audio 0 1\n").unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic: {err}");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(err.contains("plugin 0 not found"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

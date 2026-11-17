@@ -483,15 +483,15 @@ fn run_line(line: &str) -> bool {
                             let mgr = manager().lock().unwrap();
                             let inst = mgr.get_instance(pid);
                             let q = mgr.get_midi_queue(pid);
-                            let gain = mgr.get_gain_handle(pid).unwrap();
+                            let gain = mgr.get_gain_handle(pid);
                             drop(mgr);
                             let defaults = audio_defaults().lock().unwrap();
                             let dev_idx = dev_idx.or(defaults.device_index);
                             let sr = sr.or(defaults.sample_rate);
                             let bs = bs.or(defaults.buffer_size);
                             drop(defaults);
-                            match (inst, q) {
-                                (Some(inst), Some(q)) => {
+                            match (inst, q, gain) {
+                                (Some(inst), Some(q), Some(gain)) => {
                                     match spaph_audio::start_audio(inst, q, dev_idx, sr, bs, gain) {
                                         Ok(handle) => {
                                             *AUDIO_HANDLE.lock().unwrap() = Some(handle);
