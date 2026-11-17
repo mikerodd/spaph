@@ -46,37 +46,6 @@ pub enum Command {
     UnloadPlugin { id: u32 },
     ShowPlugin { id: u32 },
     Quit,
-    DumpAppConfig { path: String },
-    DumpPluginsConfig { path: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppConfig {
-    pub audio: AudioConfig,
-    pub osc: OscConfig,
-    pub plugins: Vec<PluginConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioConfig {
-    pub backend: String,
-    pub sample_rate: u32,
-    pub buffer_size: u32,
-    pub input_device: Option<String>,
-    pub output_device: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OscConfig {
-    pub bind_addr: String,
-    pub port: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginConfig {
-    pub path: String,
-    pub format: Option<PluginFormat>,
-    pub bypass: bool,
 }
 
 #[cfg(test)]
@@ -90,28 +59,6 @@ mod tests {
             let back: PluginFormat = serde_json::from_str(&json).unwrap();
             assert_eq!(f, back);
         }
-    }
-
-    #[test]
-    fn app_config_default_serializes() {
-        let cfg = AppConfig {
-            audio: AudioConfig {
-                backend: "pipewire".into(),
-                sample_rate: 48000,
-                buffer_size: 512,
-                input_device: None,
-                output_device: None,
-            },
-            osc: OscConfig {
-                bind_addr: "0.0.0.0".into(),
-                port: 9000,
-            },
-            plugins: vec![],
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: AppConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.audio.sample_rate, 48000);
-        assert_eq!(back.osc.port, 9000);
     }
 
     #[test]

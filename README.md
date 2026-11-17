@@ -30,9 +30,43 @@ cargo build --release --features spaph-audio/asio
 ## Run
 
 ```sh
-./target/release/spaph
-spaph> help
+./target/release/spaph                 # uses ./spaph.json if present
+./target/release/spaph --config rig.json
 ```
+
+Command-line options override the configuration file:
+`--config`, `--sample-rate`, `--buffer-size`, `--audio-device`, `--log-level`, `--osc-port`.
+
+## Configuration file (`spaph.json`)
+
+Every field is optional; unset fields use built-in defaults.
+
+```json
+{
+  "audio": { "sample_rate": 48000, "buffer_size": 256, "device_index": 0 },
+  "osc": { "port": 9000 },
+  "log_level": "info",
+  "script": "startup.spaph"
+}
+```
+
+Unknown keys are an error. Precedence: command line > file > default.
+
+## Startup script
+
+The script is a text file with one prompt command per line. Blank lines and lines
+starting with `#` are ignored. A relative `script` path is relative to the config file.
+
+```
+# startup.spaph
+load /usr/lib/vst/amsynth_vst.so
+select 1 5
+connect audio 1 0 48000 256
+```
+
+- If a command fails, spaph prints the line and exits with code 1.
+- `quit` ends the script; the program keeps running and opens the prompt.
+- `midi listen` is interactive only: it is skipped with a warning in a script.
 
 ## License
 

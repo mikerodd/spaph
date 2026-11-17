@@ -1735,6 +1735,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spaph-audio",
+ "spaph-config",
  "spaph-core",
  "spaph-midi",
  "spaph-osc",
@@ -1750,10 +1751,8 @@ dependencies = [
 name = "spaph-config"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "serde",
  "serde_json",
- "spaph-types",
  "thiserror 2.0.21",
 ]
 
