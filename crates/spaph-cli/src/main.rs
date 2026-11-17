@@ -258,7 +258,7 @@ fn midi_connect(port: String, plugin_id: u32) {
     let stop = Arc::new(AtomicBool::new(false));
     midi_stop_flags().lock().unwrap().push(stop.clone());
     let port_clone = port.clone();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let listener = if let Ok(idx) = port_clone.parse::<usize>() {
             spaph_midi::open_input(idx)
         } else {
@@ -286,6 +286,7 @@ fn midi_connect(port: String, plugin_id: u32) {
             }
         }
     });
+    midi_thread_handles().lock().unwrap().push(handle);
 }
 
 fn parse_select_args(parts: &[String]) -> Option<(u32, u32)> {
@@ -323,6 +324,18 @@ fn scan_presets(dir: &PathBuf) {
         for f in files {
             println!("{}", f.display());
         }
+    }
+}
+
+fn cleanup_connections() {
+    AUDIO_HANDLE.with(|h| { *h.borrow_mut() = None; });
+    for f in midi_stop_flags().lock().unwrap().iter() {
+        f.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    midi_stop_flags().lock().unwrap().clear();
+    let handles: Vec<_> = midi_thread_handles().lock().unwrap().drain(..).collect();
+    for h in handles {
+        let _ = h.join();
     }
 }
 
@@ -477,11 +490,7 @@ fn run_line(line: &str) -> bool {
             }
         }
         "disconnect" => {
-            AUDIO_HANDLE.with(|h| { *h.borrow_mut() = None; });
-            for f in midi_stop_flags().lock().unwrap().iter() {
-                f.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            midi_stop_flags().lock().unwrap().clear();
+            cleanup_connections();
             println!("disconnected");
         }
         "select" => {
@@ -694,7 +703,10 @@ fn run_line(line: &str) -> bool {
                 eprintln!("invalid plugin id");
             }
         }
-        "quit" | "exit" => return false,
+        "quit" | "exit" => {
+            cleanup_connections();
+            return false;
+        }
         other => eprintln!("unknown command: {}", other),
     }
     true
@@ -736,6 +748,7 @@ fn run_shell() {
             }
         }
     }
+    cleanup_connections();
 }
 
 static MANAGER: std::sync::OnceLock<std::sync::Mutex<PluginManager>> = std::sync::OnceLock::new();
@@ -747,6 +760,13 @@ fn manager() -> &'static std::sync::Mutex<PluginManager> {
 thread_local! {
     static AUDIO_HANDLE: std::cell::RefCell<Option<spaph_audio::AudioHandle>> = std::cell::RefCell::new(None);
     static MIDI_LISTENERS: std::cell::RefCell<Vec<spaph_midi::MidiListener>> = std::cell::RefCell::new(Vec::new());
+}
+
+static MIDI_THREAD_HANDLES: std::sync::OnceLock<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
+    std::sync::OnceLock::new();
+
+fn midi_thread_handles() -> &'static std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> {
+    MIDI_THREAD_HANDLES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 fn main() {
