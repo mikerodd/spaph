@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+default-members = ["crates/spaph-cli"]
+exclude = ["third_party"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "GPL-3.0-or-later"
+authors = ["michel"]
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+rustyline = "17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cpal = { version = "0.18", features = ["pipewire", "jack", "pulseaudio"] }
+rosc = "0.11"
+midir = "0.11"
+vst3 = "0.3"
+vst = { path = "third_party/vst" }
+vst3-host = "0.11"
+libloading = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+spaph-types = { path = "crates/spaph-types" }
+spaph-plugin = { path = "crates/spaph-plugin" }
+spaph-core = { path = "crates/spaph-core" }
+spaph-config = { path = "crates/spaph-config" }
+spaph-vst2 = { path = "crates/spaph-vst2" }
+spaph-vst3 = { path = "crates/spaph-vst3" }
+spaph-audio = { path = "crates/spaph-audio" }
+spaph-osc = { path = "crates/spaph-osc" }
+spaph-midi = { path = "crates/spaph-midi" }
