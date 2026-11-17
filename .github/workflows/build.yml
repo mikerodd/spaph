@@ -84,36 +84,3 @@ jobs:
         with:
           name: spaph-windows-x86_64
           path: spaph-windows-x86_64.zip
-
-  windows-asio:
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-      - name: Download ASIO SDK
-        shell: pwsh
-        run: |
-          # ASIO SDK is freely available from Steinberg; download and extract headers
-          Invoke-WebRequest -Uri "https://www.steinberg.net/wp-content/uploads/2021/09/asiosdk_2.3.3_2019-06-14.zip/" -OutFile asio.zip
-          Expand-Archive asio.zip -DestinationPath asio-sdk
-      - name: Build
-        shell: bash
-        env:
-          ASIO_SDK_PATH: ${{ github.workspace }}/asio-sdk
-        run: cargo build --release --target x86_64-pc-windows-msvc --features spaph-audio/asio
-      - name: Package
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp target/x86_64-pc-windows-msvc/release/spaph.exe dist/
-          cd dist && 7z a ../spaph-windows-x86_64-asio.zip spaph.exe
-      - uses: actions/upload-artifact@v4
-        with:
-          name: spaph-windows-x86_64-asio
-          path: spaph-windows-x86_64-asio.zip

@@ -21,11 +21,11 @@ cargo build --release --features spaph-audio/pipewire
 ```
 (requires `libpipewire-0.3-dev` and `clang`).
 
-ASIO (Windows, optional):
+ASIO (Windows, optional, manual build):
 ```sh
 cargo build --release --features spaph-audio/asio
 ```
-(requires the Steinberg ASIO SDK).
+(requires the Steinberg ASIO SDK; download from https://www.steinberg.net/asiosdk and set `ASIO_SDK_PATH`).
 
 ## Run
 
