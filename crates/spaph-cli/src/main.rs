@@ -319,7 +319,9 @@ fn osc_thread_slot() -> &'static std::sync::Mutex<Option<std::thread::JoinHandle
 }
 
 fn cleanup_connections() {
+    tracing::debug!("shutdown: stopping audio");
     *AUDIO_HANDLE.lock().unwrap() = None;
+    tracing::debug!("shutdown: stopping MIDI");
     for f in midi_stop_flags().lock().unwrap().iter() {
         f.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -328,6 +330,40 @@ fn cleanup_connections() {
     for h in handles {
         let _ = h.join();
     }
+    tracing::debug!("shutdown: stopping OSC server");
+    osc_stop().store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = osc_thread_slot().lock().unwrap().take() {
+        let _ = h.join();
+    }
+}
+
+/// Seconds allowed for the whole shutdown (stop audio/MIDI/OSC, then unload plugins).
+const SHUTDOWN_TIMEOUT_SECS: u64 = 6;
+
+/// Stop everything and unload all plugins, then exit with `code`.
+///
+/// Runs on a helper thread with a timeout, so a plugin whose teardown hangs cannot freeze
+/// the program: after the timeout a warning is printed and the process exits anyway.
+fn shutdown(code: i32) -> ! {
+    let finished = spaph_core::run_with_timeout(
+        || {
+            cleanup_connections();
+            let plugins = manager().lock().unwrap().take_all();
+            tracing::debug!("shutdown: unloading {} plugin(s)", plugins.len());
+            drop(plugins);
+            tracing::debug!("shutdown: plugins unloaded");
+        },
+        std::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS),
+    );
+    if finished {
+        tracing::debug!("shutdown: complete");
+    } else {
+        eprintln!(
+            "warning: shutdown did not finish within {}s (a plugin may be hung); forcing exit",
+            SHUTDOWN_TIMEOUT_SECS
+        );
+    }
+    std::process::exit(code);
 }
 
 fn run_line(line: &str) -> bool {
@@ -700,9 +736,6 @@ fn run_line(line: &str) -> bool {
         }
         "quit" | "exit" => {
             // In a script, quit only ends the script; the program keeps running.
-            if !IN_SCRIPT.load(Ordering::Relaxed) {
-                cleanup_connections();
-            }
             return false;
         }
         other => cmd_err!("unknown command: {}", other),
@@ -758,7 +791,6 @@ fn run_shell(osc_port: u16) {
             }
         }
     }
-    cleanup_connections();
 }
 
 static MANAGER: std::sync::OnceLock<std::sync::Mutex<PluginManager>> = std::sync::OnceLock::new();
@@ -798,7 +830,7 @@ fn init_logging(level: &str) {
     let filter_str = if level == "none" {
         "off".to_string()
     } else {
-        format!("{},pulseaudio=off,vst3_host=warn,rustyline=off", level)
+        format!("{},pulseaudio=off,vst3_host=error,rustyline=off", level)
     };
     let filter = tracing_subscriber::EnvFilter::try_new(&filter_str)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"));
@@ -864,12 +896,12 @@ fn main() {
     if let Some(script) = script {
         if let Err(msg) = run_script(&script) {
             eprintln!("error: {}", msg);
-            cleanup_connections();
-            std::process::exit(1);
+            shutdown(1);
         }
     }
 
     run_shell(cfg.osc.port.unwrap_or(9000));
+    shutdown(0);
 }
 
 #[cfg(test)]

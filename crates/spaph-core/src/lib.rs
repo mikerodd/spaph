@@ -144,6 +144,27 @@ impl PluginManager {
     pub fn count(&self) -> usize {
         self.plugins.len()
     }
+
+    /// Remove every plugin and return them, so the caller decides when they are dropped.
+    /// Dropping a plugin runs its full VST3/VST2 teardown.
+    pub fn take_all(&mut self) -> Vec<LoadedPlugin> {
+        std::mem::take(&mut self.plugins)
+    }
+}
+
+/// Run `f` on a helper thread and wait at most `timeout` for it to finish.
+/// Returns `true` if it finished in time. On timeout the thread is left running
+/// (the caller is expected to exit the process).
+pub fn run_with_timeout<F>(f: F, timeout: std::time::Duration) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(timeout).is_ok()
 }
 
 impl Default for PluginManager {
@@ -307,6 +328,40 @@ mod tests {
         let id = insert_mock(&mut mgr);
         mgr.set_gain(id, 0.42).unwrap();
         assert!((mgr.get_gain(id).unwrap() - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn take_all_empties_manager() {
+        let mut mgr = PluginManager::new();
+        insert_mock(&mut mgr);
+        insert_mock(&mut mgr);
+        let taken = mgr.take_all();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(mgr.count(), 0);
+        assert!(mgr.list().is_empty());
+    }
+
+    #[test]
+    fn run_with_timeout_finishes_in_time() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = done.clone();
+        let ok = run_with_timeout(
+            move || d.store(true, std::sync::atomic::Ordering::SeqCst),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(ok);
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn run_with_timeout_gives_up_on_hang() {
+        let start = std::time::Instant::now();
+        let ok = run_with_timeout(
+            || std::thread::sleep(std::time::Duration::from_secs(30)),
+            std::time::Duration::from_millis(200),
+        );
+        assert!(!ok);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
