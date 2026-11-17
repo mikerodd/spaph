@@ -1,0 +1,120 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev pkg-config
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --workspace
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/spaph dist/
+          cd dist && tar czf ../spaph-linux-x86_64.tar.gz spaph
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spaph-linux-x86_64
+          path: spaph-linux-x86_64.tar.gz
+
+  linux-pipewire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libpipewire-0.3-dev clang pkg-config
+      - name: Build
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/lib/clang/$(clang --version | head -1 | sed 's/.*version //;s/ .*//')/include"
+        run: cargo build --release --features spaph-audio/pipewire
+      - name: Test
+        run: cargo test --workspace
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/spaph dist/
+          cd dist && tar czf ../spaph-linux-x86_64-pipewire.tar.gz spaph
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spaph-linux-x86_64-pipewire
+          path: spaph-linux-x86_64-pipewire.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --workspace
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/spaph.exe dist/
+          cd dist && 7z a ../spaph-windows-x86_64.zip spaph.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spaph-windows-x86_64
+          path: spaph-windows-x86_64.zip
+
+  windows-asio:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Download ASIO SDK
+        shell: pwsh
+        run: |
+          # ASIO SDK is freely available from Steinberg; download and extract headers
+          Invoke-WebRequest -Uri "https://www.steinberg.net/wp-content/uploads/2021/09/asiosdk_2.3.3_2019-06-14.zip" -OutFile asio.zip
+          Expand-Archive asio.zip -DestinationPath asio-sdk
+      - name: Build
+        shell: bash
+        env:
+          ASIO_SDK_PATH: ${{ github.workspace }}/asio-sdk
+        run: cargo build --release --target x86_64-pc-windows-msvc --features spaph-audio/asio
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/spaph.exe dist/
+          cd dist && 7z a ../spaph-windows-x86_64-asio.zip spaph.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spaph-windows-x86_64-asio
+          path: spaph-windows-x86_64-asio.zip

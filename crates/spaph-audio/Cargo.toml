@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+pipewire = ["cpal/pipewire"]
+asio = ["cpal/asio"]
+
 [dependencies]
 spaph-types = { workspace = true }
 spaph-plugin = { workspace = true }

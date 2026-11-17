@@ -20,7 +20,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-cpal = { version = "0.18", features = ["pipewire", "jack", "pulseaudio"] }
+cpal = { version = "0.18", features = ["jack", "pulseaudio"] }
 rosc = "0.11"
 midir = "0.11"
 vst3 = "0.3"

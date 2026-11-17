@@ -1,14 +1,12 @@
-<<<<<<< HEAD
 # spaph — Simple Portable Audio Plugins Host
 
-GPLv3 CLI host for VST2/VST3 (and later CLAP) audio plugins, with OSC remote control.
+GPLv3 CLI host for VST2/VST3 audio plugins, with OSC remote control and per-plugin volume.
 
 ## Build requirements
 
 - Rust (edition 2024) via rustup
-- CMake (for JUCE? not needed)
-- Linux: `libpipewire-dev`, `libjack-jackd2-dev`, `libasound2-dev`, `clang` (for bindgen), `pkg-config`
-- Windows: WASAPI (default); optional ASIO SDK for ASIO support
+- Linux: `libasound2-dev` (required); `libjack-jackd2-dev` (optional, for JACK); `libpipewire-0.3-dev` + `clang` (optional, for native PipeWire backend)
+- Windows: WASAPI is built in; optional ASIO needs the Steinberg ASIO SDK
 - macOS: CoreAudio (future)
 
 ## Build
@@ -17,15 +15,25 @@ GPLv3 CLI host for VST2/VST3 (and later CLAP) audio plugins, with OSC remote con
 cargo build --release
 ```
 
-Native PipeWire support is enabled by default and requires `libpipewire-dev` + `clang`.
+Native PipeWire backend (optional):
+```sh
+cargo build --release --features spaph-audio/pipewire
+```
+(requires `libpipewire-0.3-dev` and `clang`).
+
+ASIO (Windows, optional):
+```sh
+cargo build --release --features spaph-audio/asio
+```
+(requires the Steinberg ASIO SDK).
 
 ## Run
 
 ```sh
-./target/debug/spaph
+./target/release/spaph
 spaph> help
 ```
-=======
-# spaph
-the Simple Portable Audio Plugins Host
->>>>>>> origin/main
+
+## License
+
+GPLv3 or later.
