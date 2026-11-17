@@ -11,3 +11,4 @@ rosc = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }

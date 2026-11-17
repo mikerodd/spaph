@@ -17,6 +17,7 @@ spaph-vst2 = { workspace = true }
 spaph-vst3 = { workspace = true }
 spaph-midi = { workspace = true }
 spaph-audio = { workspace = true }
+spaph-osc = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

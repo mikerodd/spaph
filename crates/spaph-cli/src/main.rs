@@ -54,6 +54,9 @@ struct Cli {
 
     #[arg(long, default_value = "none")]
     log_level: LogLevel,
+
+    #[arg(long, default_value = "9000")]
+    osc_port: u16,
 }
 
 #[derive(Subcommand)]
@@ -327,8 +330,18 @@ fn scan_presets(dir: &PathBuf) {
     }
 }
 
+static OSC_STOP: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = std::sync::OnceLock::new();
+static OSC_THREAD: std::sync::OnceLock<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = std::sync::OnceLock::new();
+
+fn osc_stop() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    OSC_STOP.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).clone()
+}
+fn osc_thread_slot() -> &'static std::sync::Mutex<Option<std::thread::JoinHandle<()>>> {
+    OSC_THREAD.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 fn cleanup_connections() {
-    AUDIO_HANDLE.with(|h| { *h.borrow_mut() = None; });
+    *AUDIO_HANDLE.lock().unwrap() = None;
     for f in midi_stop_flags().lock().unwrap().iter() {
         f.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -463,7 +476,7 @@ fn run_line(line: &str) -> bool {
                                 (Some(inst), Some(q)) => {
                                     match spaph_audio::start_audio(inst, q, dev_idx, sr, bs, gain) {
                                         Ok(handle) => {
-                                            AUDIO_HANDLE.with(|h| *h.borrow_mut() = Some(handle));
+                                            *AUDIO_HANDLE.lock().unwrap() = Some(handle);
                                             println!("audio started for plugin {}", pid);
                                             *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = Some(pid);
                                         }
@@ -712,7 +725,7 @@ fn run_line(line: &str) -> bool {
     true
 }
 
-fn run_shell() {
+fn run_shell(osc_port: u16) {
     let mut rl = match DefaultEditor::new() {
         Ok(e) => e,
         Err(e) => {
@@ -733,6 +746,18 @@ fn run_shell() {
             return;
         }
     };
+    // Start OSC server
+    let bind = format!("0.0.0.0:{}", osc_port);
+    let stop = osc_stop();
+    stop.store(false, std::sync::atomic::Ordering::Relaxed);
+    let handle = std::thread::spawn(move || {
+        if let Err(e) = spaph_osc::run_server(&bind, |cmd| { let _ = run_line(&cmd); }, stop.clone()) {
+            eprintln!("OSC server error: {}", e);
+        }
+    });
+    *osc_thread_slot().lock().unwrap() = Some(handle);
+    eprintln!("OSC listening on 0.0.0.0:{}", osc_port);
+
     loop {
         match rl.readline("spaph> ") {
             Ok(line) => {
@@ -757,10 +782,7 @@ fn manager() -> &'static std::sync::Mutex<PluginManager> {
     MANAGER.get_or_init(|| std::sync::Mutex::new(PluginManager::new()))
 }
 
-thread_local! {
-    static AUDIO_HANDLE: std::cell::RefCell<Option<spaph_audio::AudioHandle>> = std::cell::RefCell::new(None);
-    static MIDI_LISTENERS: std::cell::RefCell<Vec<spaph_midi::MidiListener>> = std::cell::RefCell::new(Vec::new());
-}
+static AUDIO_HANDLE: std::sync::Mutex<Option<spaph_audio::AudioHandle>> = std::sync::Mutex::new(None);
 
 static MIDI_THREAD_HANDLES: std::sync::OnceLock<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
     std::sync::OnceLock::new();
@@ -795,8 +817,8 @@ fn main() {
         d.device_index = cli.audio_device;
     }
     match cli.command {
-        None => run_shell(),
-        Some(Commands::Shell) => run_shell(),
+        None => run_shell(cli.osc_port),
+        Some(Commands::Shell) => run_shell(cli.osc_port),
         Some(Commands::Load { path }) => {
             if let Err(e) = load_plugin(&path) {
                 eprintln!("error: {}", e);
@@ -864,7 +886,7 @@ fn main() {
                     (Some(inst), Some(q)) => {
                         match spaph_audio::start_audio(inst, q, dev_idx, sr, bs, gain) {
                             Ok(handle) => {
-                                AUDIO_HANDLE.with(|h| *h.borrow_mut() = Some(handle));
+                                *AUDIO_HANDLE.lock().unwrap() = Some(handle);
                                 println!("audio started for plugin {}", plugin_id);
                                 *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = Some(plugin_id);
                             }
@@ -885,7 +907,7 @@ fn main() {
             }
         },
         Some(Commands::Disconnect) => {
-            AUDIO_HANDLE.with(|h| { *h.borrow_mut() = None; });
+            *AUDIO_HANDLE.lock().unwrap() = None;
             for f in midi_stop_flags().lock().unwrap().iter() {
                 f.store(true, std::sync::atomic::Ordering::Relaxed);
             }

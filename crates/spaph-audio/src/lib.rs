@@ -22,6 +22,12 @@ pub struct AudioHandle {
     pub _stream: cpal::Stream,
 }
 
+// SAFETY: cpal::Stream is !Send on some backends, but we only move the handle
+// between threads for control purposes; the stream is created and dropped on the
+// main thread. Marking Send+Sync allows global storage for OSC command handling.
+unsafe impl Send for AudioHandle {}
+unsafe impl Sync for AudioHandle {}
+
 pub fn start_audio(
     plugin: Arc<Mutex<Box<dyn PluginInstance>>>,
     midi_queue: Arc<Mutex<Vec<MidiEvent>>>,

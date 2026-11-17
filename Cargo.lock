@@ -1737,6 +1737,7 @@ dependencies = [
  "spaph-audio",
  "spaph-core",
  "spaph-midi",
+ "spaph-osc",
  "spaph-plugin",
  "spaph-types",
  "spaph-vst2",
@@ -1789,6 +1790,7 @@ dependencies = [
  "spaph-types",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
