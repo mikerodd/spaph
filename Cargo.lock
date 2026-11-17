@@ -1735,7 +1735,6 @@ dependencies = [
  "serde",
  "serde_json",
  "spaph-audio",
- "spaph-config",
  "spaph-core",
  "spaph-midi",
  "spaph-plugin",

@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 spaph-types = { workspace = true }
 spaph-plugin = { workspace = true }
-spaph-config = { workspace = true }
 spaph-core = { workspace = true }
 spaph-vst2 = { workspace = true }
 spaph-vst3 = { workspace = true }
