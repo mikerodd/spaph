@@ -7,6 +7,14 @@ use spaph_types::{MidiEvent, Result, SpaphError};
 static MASTER_GAIN: std::sync::Mutex<f32> = std::sync::Mutex::new(1.0);
 use std::sync::{Arc, Mutex};
 
+pub fn device_name(index: Option<usize>) -> Option<String> {
+    let devs = list_devices().ok()?;
+    match index {
+        Some(i) => devs.get(i).cloned(),
+        None => devs.into_iter().next(),
+    }
+}
+
 pub fn list_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
     let mut out = Vec::new();

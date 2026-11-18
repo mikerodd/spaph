@@ -152,8 +152,8 @@ fn print_help() {
     println!("  plugin param get <id> <idx>   Get a parameter value");
     println!("  plugin param set <id> <idx|volume> <value>  Set a parameter or volume");
     println!("  midi list                     List MIDI input ports");
-    println!("  midi listen <port>            Capture MIDI input (index or name), Enter to stop");
-    println!("  midi connect <port> <id>      Connect a MIDI input to a plugin");
+    println!("  midi listen <port> [ch]       Capture MIDI input, optional channel filter 1..=16");
+    println!("  midi connect <port> <id> [ch] Connect a MIDI input to a plugin, optional channel filter");
     println!("  midi disconnect               Stop all MIDI connections");
     println!("  audio list                    List audio output devices");
     println!("  audio connect <id> [dev]      Connect plugin output to an audio device");
@@ -179,7 +179,7 @@ fn midi_name(ev: &MidiEvent) -> String {
     }
 }
 
-fn midi_listen(port: &str) {
+fn midi_listen(port: &str, channel: Option<u8>) {
     let listener = if let Ok(idx) = port.parse::<usize>() {
         spaph_midi::open_input(idx)
     } else {
@@ -205,7 +205,11 @@ fn midi_listen(port: &str) {
                 l.rx.recv_timeout(Duration::from_millis(100))
             };
             match res {
-                Ok(ev) => println!("{}", midi_name(&ev)),
+                Ok(ev) => {
+                    if midi_matches(&ev.data, channel) {
+                        println!("{}", midi_name(&ev));
+                    }
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(_) => {}
             }
@@ -227,7 +231,33 @@ fn midi_stop_flags() -> &'static std::sync::Mutex<Vec<std::sync::Arc<std::sync::
     MIDI_STOP_FLAGS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-fn midi_connect(port: String, plugin_id: u32) {
+fn midi_channel_of(msg: &[u8]) -> Option<u8> {
+    if msg.is_empty() {
+        return None;
+    }
+    let status = msg[0];
+    if (0x80..=0xEF).contains(&status) {
+        Some((status & 0x0F) + 1)
+    } else {
+        None
+    }
+}
+
+fn midi_matches(msg: &[u8], filter: Option<u8>) -> bool {
+    match (filter, midi_channel_of(msg)) {
+        (Some(f), Some(ch)) => f == ch,
+        _ => true,
+    }
+}
+
+fn parse_midi_channel(s: &str) -> std::result::Result<u8, String> {
+    match s.parse::<u8>() {
+        Ok(c) if (1..=16).contains(&c) => Ok(c),
+        _ => Err(format!("midi channel must be 1..=16, got '{}'", s)),
+    }
+}
+
+fn midi_connect(port: String, plugin_id: u32, channel: Option<u8>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let mgr = manager().lock().unwrap();
     let q = mgr.get_midi_queue(plugin_id);
@@ -239,6 +269,15 @@ fn midi_connect(port: String, plugin_id: u32) {
             return;
         }
     };
+    let port_name = if let Ok(idx) = port.parse::<usize>() {
+        spaph_midi::list_input_ports().ok().and_then(|ps| ps.get(idx).cloned()).unwrap_or_else(|| port.clone())
+    } else {
+        port.clone()
+    };
+    {
+        let mut mgr = manager().lock().unwrap();
+        let _ = mgr.add_midi_connection(plugin_id, port_name, channel);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     midi_stop_flags().lock().unwrap().push(stop.clone());
     let port_clone = port.clone();
@@ -262,8 +301,10 @@ fn midi_connect(port: String, plugin_id: u32) {
             }
             match listener.rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(ev) => {
-                    let mut q = q.lock().unwrap();
-                    q.push(ev);
+                    if midi_matches(&ev.data, channel) {
+                        let mut q = q.lock().unwrap();
+                        q.push(ev);
+                    }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(_) => {}
@@ -314,6 +355,7 @@ fn osc_thread_slot() -> &'static std::sync::Mutex<Option<std::thread::JoinHandle
 fn cleanup_connections() {
     tracing::debug!("shutdown: stopping audio");
     *AUDIO_HANDLE.lock().unwrap() = None;
+    manager().lock().unwrap().clear_all_audio_devices();
     tracing::debug!("shutdown: stopping MIDI");
     for f in midi_stop_flags().lock().unwrap().iter() {
         f.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -384,12 +426,29 @@ fn run_line(line: &str) -> bool {
                     "list" => {
                         let mgr = manager().lock().unwrap();
                         let list = mgr.list();
+                        // snapshot midi connections and audio armed status
+                        let midi_info: Vec<(u32, Vec<(String, Option<u8>)>)> = list.iter().map(|p| (p.id, mgr.midi_connections(p.id))).collect();
+                        let audio_armed = *ACTIVE_AUDIO_PLUGIN.lock().unwrap();
                         drop(mgr);
                         if list.is_empty() {
                             println!("(no plugins loaded)");
                         } else {
                             for p in list {
-                                println!("  #{} {} ({:?}) - {} params", p.id, p.name, p.format, p.num_params);
+                                let midi = midi_info.iter().find(|(id, _)| *id == p.id).map(|(_, c)| c.clone()).unwrap_or_default();
+                                let midi_str = if midi.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    midi.iter().map(|(port, ch)| match ch {
+                                        Some(c) => format!("{} (ch{})", port, c),
+                                        None => format!("{} (all)", port),
+                                    }).collect::<Vec<_>>().join(", ")
+                                };
+                                let audio_str = if audio_armed == Some(p.id) {
+                                    manager().lock().unwrap().audio_device_name(p.id).unwrap_or_else(|| "yes".to_string())
+                                } else {
+                                    "no".to_string()
+                                };
+                                println!("  #{} {} ({:?}) - {} params | midi: {} | audio: {}", p.id, p.name, p.format, p.num_params, midi_str, audio_str);
                             }
                         }
                     }
@@ -397,7 +456,12 @@ fn run_line(line: &str) -> bool {
                         if parts.len() < 3 {
                             cmd_err!("usage: plugin unload <plugin_id>");
                         } else if let Ok(id) = parts[2].parse::<u32>() {
+                            if *ACTIVE_AUDIO_PLUGIN.lock().unwrap() == Some(id) {
+                                *AUDIO_HANDLE.lock().unwrap() = None;
+                                *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = None;
+                            }
                             let mut mgr = manager().lock().unwrap();
+                            mgr.clear_audio_device(id);
                             match mgr.unload(id) {
                                 Ok(_) => println!("unloaded {}", id),
                                 Err(e) => cmd_err!("error: {}", e),
@@ -630,20 +694,44 @@ fn run_line(line: &str) -> bool {
                     },
                     "listen" => {
                         if parts.len() < 3 {
-                            cmd_err!("usage: midi listen <port>");
+                            cmd_err!("usage: midi listen <port> [midi_channel]");
                         } else {
-                            if IN_SCRIPT.load(Ordering::Relaxed) {
+                            let ch = if parts.len() >= 4 {
+                                match parse_midi_channel(&parts[3]) {
+                                    Ok(c) => Some(c),
+                                    Err(e) => { cmd_err!("{}", e); None }
+                                }
+                            } else {
+                                None
+                            };
+                            // if parse failed, ch is None but we already errored; skip
+                            if parts.len() >= 4 && ch.is_none() {
+                                // error already reported
+                            } else if IN_SCRIPT.load(Ordering::Relaxed) {
                                 eprintln!("warning: 'midi listen' is interactive only; skipped in script");
                             } else {
-                                midi_listen(&parts[2]);
+                                midi_listen(&parts[2], ch);
                             }
                         }
                     }
                     "connect" => {
                         if parts.len() < 4 {
-                            cmd_err!("usage: midi connect <port> <plugin_id>");
+                            cmd_err!("usage: midi connect <port> <plugin_id> [midi_channel]");
                         } else if let Ok(pid) = parts[3].parse::<u32>() {
-                            midi_connect(parts[2].clone(), pid);
+                            let ch = if parts.len() >= 5 {
+                                match parse_midi_channel(&parts[4]) {
+                                    Ok(c) => Some(c),
+                                    Err(e) => { cmd_err!("{}", e); None }
+                                }
+                            } else {
+                                None
+                            };
+                            if parts.len() >= 5 && ch.is_none() {
+                                // error already reported
+                            } else {
+                                // register connection with channel
+                                midi_connect(parts[2].clone(), pid, ch);
+                            }
                         } else {
                             cmd_err!("invalid plugin id");
                         }
@@ -687,6 +775,8 @@ fn run_line(line: &str) -> bool {
                                     match spaph_audio::start_audio(inst, q, dev_idx, None, None, gain) {
                                         Ok(handle) => {
                                             *AUDIO_HANDLE.lock().unwrap() = Some(handle);
+                                            let dev_name = spaph_audio::device_name(dev_idx).unwrap_or_else(|| "default".to_string());
+                                            manager().lock().unwrap().set_audio_device(pid, dev_name);
                                             println!("audio started for plugin {}", pid);
                                             *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = Some(pid);
                                         }
@@ -924,7 +1014,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::split_args;
+    use super::{midi_channel_of, midi_matches, parse_midi_channel, split_args};
 
     #[test]
     fn split_simple() {
@@ -958,5 +1048,63 @@ mod tests {
     #[test]
     fn split_empty() {
         assert!(split_args("   ").is_empty());
+    }
+
+    #[test]
+    fn midi_channel_of_note_on() {
+        assert_eq!(midi_channel_of(&[0x90, 60, 100]), Some(1));
+        assert_eq!(midi_channel_of(&[0x9F, 60, 100]), Some(16));
+    }
+
+    #[test]
+    fn midi_channel_of_cc() {
+        assert_eq!(midi_channel_of(&[0xB3, 7, 100]), Some(4));
+    }
+
+    #[test]
+    fn midi_channel_of_system_is_none() {
+        assert_eq!(midi_channel_of(&[0xF8]), None);
+        assert_eq!(midi_channel_of(&[0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7]), None);
+        assert_eq!(midi_channel_of(&[]), None);
+    }
+
+    #[test]
+    fn midi_matches_no_filter_matches_all() {
+        assert!(midi_matches(&[0x90, 60, 100], None));
+        assert!(midi_matches(&[0x80, 60, 0], None));
+        assert!(midi_matches(&[0xF8], None));
+    }
+
+    #[test]
+    fn midi_matches_filter_accepts_matching_channel() {
+        assert!(midi_matches(&[0x90, 60, 100], Some(1)));
+        assert!(midi_matches(&[0xB0, 7, 100], Some(1)));
+    }
+
+    #[test]
+    fn midi_matches_filter_rejects_other_channel() {
+        assert!(!midi_matches(&[0x91, 60, 100], Some(1)));
+        assert!(!midi_matches(&[0x9F, 60, 100], Some(1)));
+    }
+
+    #[test]
+    fn midi_matches_filter_passes_system_messages() {
+        assert!(midi_matches(&[0xF8], Some(1)));
+        assert!(midi_matches(&[0xF0, 0x00], Some(1)));
+    }
+
+    #[test]
+    fn parse_midi_channel_valid() {
+        for c in 1u8..=16 {
+            assert_eq!(parse_midi_channel(&c.to_string()).unwrap(), c);
+        }
+    }
+
+    #[test]
+    fn parse_midi_channel_invalid() {
+        assert!(parse_midi_channel("0").is_err());
+        assert!(parse_midi_channel("17").is_err());
+        assert!(parse_midi_channel("abc").is_err());
+        assert!(parse_midi_channel("").is_err());
     }
 }

@@ -26,6 +26,8 @@ pub struct LoadedPlugin {
     pub instance: std::sync::Arc<std::sync::Mutex<Box<dyn PluginInstance>>>,
     pub midi_queue: std::sync::Arc<std::sync::Mutex<Vec<spaph_types::MidiEvent>>>,
     pub gain: std::sync::Arc<std::sync::Mutex<f32>>,
+    pub midi_connections: Vec<(String, Option<u8>)>,
+    pub audio_device: Option<String>,
 }
 
 pub struct PluginManager {
@@ -71,6 +73,8 @@ impl PluginManager {
             instance: std::sync::Arc::new(std::sync::Mutex::new(instance)),
             midi_queue: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             gain: std::sync::Arc::new(std::sync::Mutex::new(1.0)),
+            midi_connections: Vec::new(),
+            audio_device: None,
         });
         Ok(id)
     }
@@ -139,6 +143,53 @@ impl PluginManager {
 
     pub fn get_gain_handle(&self, id: u32) -> Option<std::sync::Arc<std::sync::Mutex<f32>>> {
         self.plugins.iter().find(|p| p.id == id).map(|p| p.gain.clone())
+    }
+
+    pub fn add_midi_connection(&mut self, id: u32, port: String, channel: Option<u8>) -> Result<()> {
+        let p = self.plugins.iter_mut().find(|p| p.id == id)
+            .ok_or_else(|| SpaphError::Plugin(format!("no plugin with id {}", id)))?;
+        p.midi_connections.push((port, channel));
+        Ok(())
+    }
+
+    pub fn clear_midi_connections(&mut self, id: u32) {
+        if let Some(p) = self.plugins.iter_mut().find(|p| p.id == id) {
+            p.midi_connections.clear();
+        }
+    }
+
+    pub fn midi_connections(&self, id: u32) -> Vec<(String, Option<u8>)> {
+        self.plugins.iter().find(|p| p.id == id)
+            .map(|p| p.midi_connections.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn clear_all_midi_connections(&mut self) {
+        for p in &mut self.plugins {
+            p.midi_connections.clear();
+        }
+    }
+
+    pub fn set_audio_device(&mut self, id: u32, name: String) {
+        if let Some(p) = self.plugins.iter_mut().find(|p| p.id == id) {
+            p.audio_device = Some(name);
+        }
+    }
+
+    pub fn clear_audio_device(&mut self, id: u32) {
+        if let Some(p) = self.plugins.iter_mut().find(|p| p.id == id) {
+            p.audio_device = None;
+        }
+    }
+
+    pub fn clear_all_audio_devices(&mut self) {
+        for p in &mut self.plugins {
+            p.audio_device = None;
+        }
+    }
+
+    pub fn audio_device_name(&self, id: u32) -> Option<String> {
+        self.plugins.iter().find(|p| p.id == id).and_then(|p| p.audio_device.clone())
     }
 
     pub fn count(&self) -> usize {
@@ -234,6 +285,8 @@ mod tests {
             instance: std::sync::Arc::new(std::sync::Mutex::new(Box::new(MockPlugin { info: mock_info() }))),
             midi_queue: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             gain: std::sync::Arc::new(std::sync::Mutex::new(1.0)),
+            midi_connections: Vec::new(),
+            audio_device: None,
         });
         id
     }
