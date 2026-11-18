@@ -86,13 +86,27 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
-    parse_config(&text, path)
+    let text = if text.trim().is_empty() { "{}" } else { text.as_str() };
+    parse_config(text, path)
 }
 
 /// Return `<dir>/spaph.json` if that file exists.
 pub fn find_default_config(dir: &Path) -> Option<PathBuf> {
     let candidate = dir.join(DEFAULT_CONFIG_NAME);
     candidate.is_file().then_some(candidate)
+}
+
+/// Search order: executable's own directory first (so the binary behaves the same
+/// regardless of the current working directory), then the working directory.
+pub fn find_default_config_any() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(p) = find_default_config(dir) {
+                return Some(p);
+            }
+        }
+    }
+    std::env::current_dir().ok().and_then(|d| find_default_config(&d))
 }
 
 /// Apply command-line overrides on top of the configuration.
