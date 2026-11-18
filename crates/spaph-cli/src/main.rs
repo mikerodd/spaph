@@ -274,9 +274,13 @@ fn midi_connect(port: String, plugin_id: u32, channel: Option<u8>) {
     } else {
         port.clone()
     };
+    // reject duplicate connection (same port + same channel filter) with a warning
     {
         let mut mgr = manager().lock().unwrap();
-        let _ = mgr.add_midi_connection(plugin_id, port_name, channel);
+        if let Err(e) = mgr.add_midi_connection(plugin_id, port_name.clone(), channel) {
+            eprintln!("warning: {}", e);
+            return;
+        }
     }
     let stop = Arc::new(AtomicBool::new(false));
     midi_stop_flags().lock().unwrap().push(stop.clone());
@@ -291,6 +295,7 @@ fn midi_connect(port: String, plugin_id: u32, channel: Option<u8>) {
             Ok(l) => l,
             Err(e) => {
                 cmd_err!("error: {}", e);
+                manager().lock().unwrap().remove_midi_connection(plugin_id, &port_name, channel);
                 return;
             }
         };

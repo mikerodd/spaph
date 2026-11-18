@@ -145,11 +145,24 @@ impl PluginManager {
         self.plugins.iter().find(|p| p.id == id).map(|p| p.gain.clone())
     }
 
-    pub fn add_midi_connection(&mut self, id: u32, port: String, channel: Option<u8>) -> Result<()> {
+    pub fn add_midi_connection(&mut self, id: u32, port: String, channel: Option<u8>) -> std::result::Result<(), String> {
         let p = self.plugins.iter_mut().find(|p| p.id == id)
-            .ok_or_else(|| SpaphError::Plugin(format!("no plugin with id {}", id)))?;
+            .ok_or_else(|| format!("no plugin with id {}", id))?;
+        // reject an exact duplicate (same port + same channel filter)
+        if p.midi_connections.iter().any(|(pp, cc)| pp == &port && *cc == channel) {
+            return Err(format!(
+                "plugin {} is already connected to '{}' with the same channel filter",
+                id, port
+            ));
+        }
         p.midi_connections.push((port, channel));
         Ok(())
+    }
+
+    pub fn remove_midi_connection(&mut self, id: u32, port: &str, channel: Option<u8>) {
+        if let Some(p) = self.plugins.iter_mut().find(|p| p.id == id) {
+            p.midi_connections.retain(|(pp, cc)| !(pp == port && *cc == channel));
+        }
     }
 
     pub fn clear_midi_connections(&mut self, id: u32) {
