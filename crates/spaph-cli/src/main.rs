@@ -832,9 +832,18 @@ fn midi_thread_handles() -> &'static std::sync::Mutex<Vec<std::thread::JoinHandl
 fn load_startup_config(cli: &Cli) -> (Option<PathBuf>, Config) {
     let path = match &cli.config {
         Some(p) => Some(p.clone()),
-        None => std::env::current_dir()
-            .ok()
-            .and_then(|d| spaph_config::find_default_config(&d)),
+        None => {
+            // 1. current working directory, then 2. the executable's own directory
+            std::env::current_dir()
+                .ok()
+                .and_then(|d| spaph_config::find_default_config(&d))
+                .or_else(|| {
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|e| e.parent().map(|d| spaph_config::find_default_config(d)))
+                        .flatten()
+                })
+        }
     };
     let cfg = match &path {
         Some(p) => spaph_config::load_config(p).unwrap_or_else(|e| {
