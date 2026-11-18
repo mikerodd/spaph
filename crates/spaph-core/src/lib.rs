@@ -148,12 +148,16 @@ impl PluginManager {
     pub fn add_midi_connection(&mut self, id: u32, port: String, channel: Option<u8>) -> std::result::Result<(), String> {
         let p = self.plugins.iter_mut().find(|p| p.id == id)
             .ok_or_else(|| format!("no plugin with id {}", id))?;
-        // reject an exact duplicate (same port + same channel filter)
-        if p.midi_connections.iter().any(|(pp, cc)| pp == &port && *cc == channel) {
-            return Err(format!(
-                "plugin {} is already connected to '{}' with the same channel filter",
-                id, port
-            ));
+        // reject a conflicting connection on the same port:
+        // - an "all channels" connection conflicts with any other on that port
+        // - two connections with the same channel conflict
+        for (pp, cc) in &p.midi_connections {
+            if pp == &port && (cc.is_none() || channel.is_none() || *cc == channel) {
+                return Err(format!(
+                    "plugin {} is already connected to '{}' in a conflicting way (all-channels or same channel)",
+                    id, port
+                ));
+            }
         }
         p.midi_connections.push((port, channel));
         Ok(())
@@ -435,5 +439,47 @@ mod tests {
         let mut mgr = PluginManager::new();
         assert!(mgr.get_gain(999).is_err());
         assert!(mgr.set_gain(999, 1.0).is_err());
+    }
+
+    #[test]
+    fn midi_connection_allows_different_channels() {
+        let mut mgr = PluginManager::new();
+        let id = insert_mock(&mut mgr);
+        assert!(mgr.add_midi_connection(id, "port".into(), Some(1)).is_ok());
+        assert!(mgr.add_midi_connection(id, "port".into(), Some(2)).is_ok());
+        assert_eq!(mgr.midi_connections(id).len(), 2);
+    }
+
+    #[test]
+    fn midi_connection_rejects_duplicate_channel() {
+        let mut mgr = PluginManager::new();
+        let id = insert_mock(&mut mgr);
+        assert!(mgr.add_midi_connection(id, "port".into(), Some(1)).is_ok());
+        assert!(mgr.add_midi_connection(id, "port".into(), Some(1)).is_err());
+    }
+
+    #[test]
+    fn midi_connection_all_conflicts_with_specific() {
+        let mut mgr = PluginManager::new();
+        let id = insert_mock(&mut mgr);
+        assert!(mgr.add_midi_connection(id, "port".into(), None).is_ok());
+        assert!(mgr.add_midi_connection(id, "port".into(), Some(1)).is_err());
+    }
+
+    #[test]
+    fn midi_connection_specific_conflicts_with_all() {
+        let mut mgr = PluginManager::new();
+        let id = insert_mock(&mut mgr);
+        assert!(mgr.add_midi_connection(id, "port".into(), Some(1)).is_ok());
+        assert!(mgr.add_midi_connection(id, "port".into(), None).is_err());
+    }
+
+    #[test]
+    fn midi_connection_same_port_different_plugins_ok() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        assert!(mgr.add_midi_connection(a, "port".into(), None).is_ok());
+        assert!(mgr.add_midi_connection(b, "port".into(), None).is_ok());
     }
 }
