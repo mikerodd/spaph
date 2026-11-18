@@ -155,9 +155,10 @@ fn print_help() {
     println!("  midi listen <port> [ch]       Capture MIDI input, optional channel filter 1..=16");
     println!("  midi connect <port> <id> [ch] Connect a MIDI input to a plugin, optional channel filter");
     println!("  midi disconnect               Stop all MIDI connections");
+    println!("  midi disconnect <port> <id> [ch]  Disconnect one MIDI connection");
     println!("  audio list                    List audio output devices");
     println!("  audio connect <id> [dev]      Connect plugin output to an audio device");
-    println!("  audio disconnect [id]         Disconnect audio (one or all)");
+    println!("  audio disconnect [id] [dev]   Disconnect audio (one or all)");
     println!("  volume [<id>] <level>         Set host-side output gain (per plugin)");
     println!("  master <level>                Set master output gain");
     println!("  disconnect                    Stop all audio and MIDI connections");
@@ -224,13 +225,6 @@ fn midi_listen(port: &str, channel: Option<u8>) {
     println!("stopped.");
 }
 
-static MIDI_STOP_FLAGS: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>> =
-    std::sync::OnceLock::new();
-
-fn midi_stop_flags() -> &'static std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
-    MIDI_STOP_FLAGS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
 fn midi_channel_of(msg: &[u8]) -> Option<u8> {
     if msg.is_empty() {
         return None;
@@ -283,8 +277,9 @@ fn midi_connect(port: String, plugin_id: u32, channel: Option<u8>) {
         }
     }
     let stop = Arc::new(AtomicBool::new(false));
-    midi_stop_flags().lock().unwrap().push(stop.clone());
     let port_clone = port.clone();
+    let port_name_for_thread = port_name.clone();
+    let stop_for_conn = stop.clone();
     let handle = std::thread::spawn(move || {
         let listener = if let Ok(idx) = port_clone.parse::<usize>() {
             spaph_midi::open_input(idx)
@@ -295,7 +290,7 @@ fn midi_connect(port: String, plugin_id: u32, channel: Option<u8>) {
             Ok(l) => l,
             Err(e) => {
                 cmd_err!("error: {}", e);
-                manager().lock().unwrap().remove_midi_connection(plugin_id, &port_name, channel);
+                manager().lock().unwrap().remove_midi_connection(plugin_id, &port_name_for_thread, channel);
                 return;
             }
         };
@@ -316,7 +311,13 @@ fn midi_connect(port: String, plugin_id: u32, channel: Option<u8>) {
             }
         }
     });
-    midi_thread_handles().lock().unwrap().push(handle);
+    midi_connections().lock().unwrap().push(MidiConn {
+        port: port_name.clone(),
+        plugin_id,
+        channel,
+        stop: stop_for_conn,
+        handle,
+    });
 }
 
 fn scan_presets(dir: &PathBuf) {
@@ -357,19 +358,114 @@ fn osc_thread_slot() -> &'static std::sync::Mutex<Option<std::thread::JoinHandle
     OSC_THREAD.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+struct MidiConn {
+    port: String,
+    plugin_id: u32,
+    channel: Option<u8>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+static MIDI_CONNECTIONS: std::sync::OnceLock<std::sync::Mutex<Vec<MidiConn>>> =
+    std::sync::OnceLock::new();
+
+fn midi_connections() -> &'static std::sync::Mutex<Vec<MidiConn>> {
+    MIDI_CONNECTIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn resolve_midi_port_name(port: &str) -> String {
+    if let Ok(idx) = port.parse::<usize>() {
+        spaph_midi::list_input_ports()
+            .ok()
+            .and_then(|ps| ps.get(idx).cloned())
+            .unwrap_or_else(|| port.to_string())
+    } else {
+        port.to_string()
+    }
+}
+
+fn disconnect_all_midi() {
+    let conns: Vec<MidiConn> = midi_connections().lock().unwrap().drain(..).collect();
+    for c in conns {
+        c.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = c.handle.join();
+    }
+    manager().lock().unwrap().clear_all_midi_connections();
+}
+
+fn disconnect_midi_filtered(
+    port: Option<&str>,
+    plugin_id: Option<u32>,
+    channel: Option<u8>,
+) -> std::result::Result<(), String> {
+    let port_name = port.map(resolve_midi_port_name);
+    let mut conns = midi_connections().lock().unwrap();
+    let mut to_remove = Vec::new();
+    for (i, c) in conns.iter().enumerate() {
+        let port_ok = port_name.as_ref().map_or(true, |p| c.port == *p);
+        let plugin_ok = plugin_id.map_or(true, |id| c.plugin_id == id);
+        let channel_ok = channel.map_or(true, |ch| c.channel == Some(ch));
+        if port_ok && plugin_ok && channel_ok {
+            to_remove.push(i);
+        }
+    }
+    if to_remove.is_empty() {
+        return Err("no matching MIDI connection".to_string());
+    }
+    let mut removed = Vec::new();
+    for &i in to_remove.iter().rev() {
+        let c = conns.remove(i);
+        c.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = c.handle.join();
+        removed.push((c.plugin_id, c.port, c.channel));
+    }
+    drop(conns);
+    let mut mgr = manager().lock().unwrap();
+    for (pid, port, ch) in removed {
+        mgr.remove_midi_connection(pid, &port, ch);
+    }
+    Ok(())
+}
+
+fn disconnect_all_audio() {
+    *AUDIO_HANDLE.lock().unwrap() = None;
+    let active = *ACTIVE_AUDIO_PLUGIN.lock().unwrap();
+    if let Some(id) = active {
+        manager().lock().unwrap().clear_audio_device(id);
+    }
+    *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = None;
+}
+
+fn disconnect_audio(plugin_id: Option<u32>, dev: Option<&str>) -> std::result::Result<(), String> {
+    let active = *ACTIVE_AUDIO_PLUGIN.lock().unwrap();
+    match plugin_id {
+        Some(id) => {
+            if active != Some(id) {
+                return Err(format!("plugin {} is not connected to audio", id));
+            }
+            if let Some(dev) = dev {
+                let name = manager().lock().unwrap().audio_device_name(id).unwrap_or_default();
+                if dev != name {
+                    return Err(format!("plugin {} is not connected to audio device '{}'", id, dev));
+                }
+            }
+            *AUDIO_HANDLE.lock().unwrap() = None;
+            manager().lock().unwrap().clear_audio_device(id);
+            *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = None;
+            Ok(())
+        }
+        None => {
+            disconnect_all_audio();
+            Ok(())
+        }
+    }
+}
+
 fn cleanup_connections() {
     tracing::debug!("shutdown: stopping audio");
-    *AUDIO_HANDLE.lock().unwrap() = None;
-    manager().lock().unwrap().clear_all_audio_devices();
+    disconnect_all_audio();
     tracing::debug!("shutdown: stopping MIDI");
-    for f in midi_stop_flags().lock().unwrap().iter() {
-        f.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    midi_stop_flags().lock().unwrap().clear();
-    let handles: Vec<_> = midi_thread_handles().lock().unwrap().drain(..).collect();
-    for h in handles {
-        let _ = h.join();
-    }
+    disconnect_all_midi();
     tracing::debug!("shutdown: stopping OSC server");
     osc_stop().store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(h) = osc_thread_slot().lock().unwrap().take() {
@@ -742,8 +838,39 @@ fn run_line(line: &str) -> bool {
                         }
                     }
                     "disconnect" => {
-                        cleanup_connections();
-                        println!("disconnected");
+                        if parts.len() == 2 {
+                            // midi disconnect (no args) -> disconnect all MIDI
+                            disconnect_all_midi();
+                            println!("midi disconnected");
+                        } else if parts.len() == 4 {
+                            // midi disconnect <port> <id>
+                            let port = &parts[2];
+                            let pid: u32 = match parts[3].parse() {
+                                Ok(v) => v,
+                                Err(_) => { cmd_err!("invalid plugin id"); return true; }
+                            };
+                            match disconnect_midi_filtered(Some(port), Some(pid), None) {
+                                Ok(_) => println!("midi disconnected"),
+                                Err(e) => cmd_err!("error: {}", e),
+                            }
+                        } else if parts.len() == 5 {
+                            // midi disconnect <port> <id> <channel>
+                            let port = &parts[2];
+                            let pid: u32 = match parts[3].parse() {
+                                Ok(v) => v,
+                                Err(_) => { cmd_err!("invalid plugin id"); return true; }
+                            };
+                            let ch = match parse_midi_channel(&parts[4]) {
+                                Ok(c) => c,
+                                Err(e) => { cmd_err!("{}", e); return true; }
+                            };
+                            match disconnect_midi_filtered(Some(port), Some(pid), Some(ch)) {
+                                Ok(_) => println!("midi disconnected"),
+                                Err(e) => cmd_err!("error: {}", e),
+                            }
+                        } else {
+                            cmd_err!("usage: midi disconnect [<port> <plugin_id> [channel]]");
+                        }
                     }
                     other => cmd_err!("unknown midi action: {}", other),
                 }
@@ -795,8 +922,12 @@ fn run_line(line: &str) -> bool {
                         }
                     }
                     "disconnect" => {
-                        *AUDIO_HANDLE.lock().unwrap() = None;
-                        println!("audio disconnected");
+                        let pid = parts.get(2).and_then(|s| s.parse::<u32>().ok());
+                        let dev = parts.get(3).map(|s| s.as_str());
+                        match disconnect_audio(pid, dev) {
+                            Ok(_) => println!("audio disconnected"),
+                            Err(e) => cmd_err!("error: {}", e),
+                        }
                     }
                     other => cmd_err!("unknown audio action: {}", other),
                 }
@@ -915,13 +1046,6 @@ fn manager() -> &'static std::sync::Mutex<PluginManager> {
 }
 
 static AUDIO_HANDLE: std::sync::Mutex<Option<spaph_audio::AudioHandle>> = std::sync::Mutex::new(None);
-
-static MIDI_THREAD_HANDLES: std::sync::OnceLock<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
-    std::sync::OnceLock::new();
-
-fn midi_thread_handles() -> &'static std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> {
-    MIDI_THREAD_HANDLES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
 
 /// Load the configuration: `--config` if given (must exist), else `./spaph.json` if present.
 fn load_startup_config(cli: &Cli) -> (Option<PathBuf>, Config) {

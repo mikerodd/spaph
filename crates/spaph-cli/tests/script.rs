@@ -132,3 +132,52 @@ fn connect_audio_with_unknown_plugin_id_reports_error_without_panic() {
     assert!(err.contains("plugin 0 not found"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn midi_disconnect_targeted_unknown_reports_error() {
+    let dir = scratch("mdis");
+    std::fs::write(dir.join("s.spaph"), "midi disconnect 999 1\n").unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no matching MIDI connection"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn audio_disconnect_unknown_reports_error() {
+    let dir = scratch("adis");
+    std::fs::write(dir.join("s.spaph"), "audio disconnect 999\n").unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not connected to audio"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn midi_disconnect_all_in_script_ok() {
+    let dir = scratch("mdisall");
+    std::fs::write(dir.join("s.spaph"), "midi disconnect\n").unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
