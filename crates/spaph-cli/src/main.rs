@@ -139,25 +139,28 @@ fn print_help() {
     println!("spaph - Simple Portable Audio Plugins Host");
     println!("Commands:");
     println!("  help                          Show this help");
-    println!("  load <path>                   Load a plugin and display its interface");
-    println!("  list midi                     List MIDI input ports");
-    println!("  list plugins                  List loaded plugins");
-    println!("  list presets <id>             List presets of a plugin");
-    println!("  list audio                    List audio output devices");
+    println!("  plugin load <path>            Load a plugin and display its interface");
+    println!("  plugin list                   List loaded plugins");
+    println!("  plugin unload <id>            Unload a plugin by id");
+    println!("  plugin show <id>              Show plugin editor UI (VST3)");
+    println!("  plugin preset list <id>       List presets of a plugin");
+    println!("  plugin preset select <id> <n> Select a preset (1-based)");
+    println!("  plugin preset scan <dir>      Scan a directory for preset files");
+    println!("  plugin preset load <id> <file> Load a preset file into a plugin");
+    println!("  plugin preset save <id> <file> Save current state as preset file");
+    println!("  plugin param list <id>         List plugin parameters");
+    println!("  plugin param get <id> <idx>   Get a parameter value");
+    println!("  plugin param set <id> <idx|volume> <value>  Set a parameter or volume");
+    println!("  midi list                     List MIDI input ports");
     println!("  midi listen <port>            Capture MIDI input (index or name), Enter to stop");
-    println!("  unload <id>                   Unload a plugin by id");
-    println!("  show <plugin_id>              Show plugin editor UI (VST3)");
-    println!("  select <plugin_id> <preset_id> Select a preset (1-based)");
-    println!("  connect audio <id> [dev]      Connect plugin output to an audio device");
-    println!("  connect midi <port> <id>      Connect a MIDI input to a plugin");
+    println!("  midi connect <port> <id>      Connect a MIDI input to a plugin");
+    println!("  midi disconnect               Stop all MIDI connections");
+    println!("  audio list                    List audio output devices");
+    println!("  audio connect <id> [dev]      Connect plugin output to an audio device");
+    println!("  audio disconnect [id]         Disconnect audio (one or all)");
     println!("  volume [<id>] <level>         Set host-side output gain (per plugin)");
-    println!("  param list <id>               List plugin parameters");
-    println!("  param get <id> <index>        Get a parameter value");
-    println!("  param set <id> <idx|volume> <value>  Set a parameter or volume");
-    println!("  preset scan <dir>             Scan a directory for preset files");
-    println!("  preset load <id> <file>       Load a preset file into a plugin");
-    println!("  preset save <id> <file>       Save current state as preset file");
-    println!("  disconnect                    Stop audio and MIDI connections");
+    println!("  master <level>                Set master output gain");
+    println!("  disconnect                    Stop all audio and MIDI connections");
     println!("  quit | exit                   Exit the shell");
 }
 
@@ -270,16 +273,6 @@ fn midi_connect(port: String, plugin_id: u32) {
     midi_thread_handles().lock().unwrap().push(handle);
 }
 
-fn parse_select_args(parts: &[String]) -> Option<(u32, u32)> {
-    if parts.len() >= 4 && parts[1] == "preset" {
-        Some((parts[2].parse().ok()?, parts[3].parse().ok()?))
-    } else if parts.len() >= 3 {
-        Some((parts[1].parse().ok()?, parts[2].parse().ok()?))
-    } else {
-        None
-    }
-}
-
 fn scan_presets(dir: &PathBuf) {
     fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -373,43 +366,22 @@ fn run_line(line: &str) -> bool {
     }
     match parts[0].as_str() {
         "help" => print_help(),
-        "load" => {
+        "plugin" => {
             if parts.len() < 2 {
-                cmd_err!("usage: load <path>");
-            } else {
-                let path = PathBuf::from(&parts[1]);
-                if let Err(e) = load_plugin(&path) {
-                    cmd_err!("error: {}", e);
-                }
-            }
-        }
-        "list" => {
-            if parts.len() < 2 {
-                cmd_err!("usage: list <midi|audio|plugins|presets>");
+                cmd_err!("usage: plugin <load|list|unload|show|preset|param|volume> ...");
             } else {
                 match parts[1].as_str() {
-                    "presets" => {
+                    "load" => {
                         if parts.len() < 3 {
-                            cmd_err!("usage: list presets <plugin_id>");
-                        } else if let Ok(pid) = parts[2].parse::<u32>() {
-                            let mgr = manager().lock().unwrap();
-                            match mgr.list_presets(pid) {
-                                Ok(ps) => {
-                                    if ps.is_empty() {
-                                        println!("(no presets)");
-                                    } else {
-                                        for (i, name) in ps.iter().enumerate() {
-                                            println!("  [{}] {}", i + 1, name);
-                                        }
-                                    }
-                                }
-                                Err(e) => cmd_err!("error: {}", e),
-                            }
+                            cmd_err!("usage: plugin load <path>");
                         } else {
-                            cmd_err!("invalid plugin id");
+                            let path = PathBuf::from(&parts[2]);
+                            if let Err(e) = load_plugin(&path) {
+                                cmd_err!("error: {}", e);
+                            }
                         }
                     }
-                    "plugins" => {
+                    "list" => {
                         let mgr = manager().lock().unwrap();
                         let list = mgr.list();
                         drop(mgr);
@@ -421,7 +393,231 @@ fn run_line(line: &str) -> bool {
                             }
                         }
                     }
-                    "midi" => match spaph_midi::list_input_ports() {
+                    "unload" => {
+                        if parts.len() < 3 {
+                            cmd_err!("usage: plugin unload <plugin_id>");
+                        } else if let Ok(id) = parts[2].parse::<u32>() {
+                            let mut mgr = manager().lock().unwrap();
+                            match mgr.unload(id) {
+                                Ok(_) => println!("unloaded {}", id),
+                                Err(e) => cmd_err!("error: {}", e),
+                            }
+                        } else {
+                            cmd_err!("invalid plugin id");
+                        }
+                    }
+                    "show" => {
+                        if parts.len() < 3 {
+                            cmd_err!("usage: plugin show <plugin_id>");
+                        } else if let Ok(pid) = parts[2].parse::<u32>() {
+                            let mgr = manager().lock().unwrap();
+                            let inst = mgr.get_instance(pid);
+                            drop(mgr);
+                            if let Some(inst) = inst {
+                                let mut inst = inst.lock().unwrap();
+                                if !inst.has_editor() {
+                                    cmd_err!("plugin {} has no editor", pid);
+                                } else {
+                                    println!("opening editor for plugin {} (close window to continue)", pid);
+                                    if let Err(e) = inst.open_editor() {
+                                        cmd_err!("error: {}", e);
+                                    }
+                                }
+                            } else {
+                                cmd_err!("plugin {} not found", pid);
+                            }
+                        } else {
+                            cmd_err!("invalid plugin id");
+                        }
+                    }
+                    "preset" => {
+                        if parts.len() < 3 {
+                            cmd_err!("usage: plugin preset <list|select|scan|load|save> ...");
+                        } else {
+                            match parts[2].as_str() {
+                                "list" => {
+                                    if parts.len() < 4 {
+                                        cmd_err!("usage: plugin preset list <plugin_id>");
+                                    } else if let Ok(pid) = parts[3].parse::<u32>() {
+                                        let mgr = manager().lock().unwrap();
+                                        match mgr.list_presets(pid) {
+                                            Ok(ps) => {
+                                                if ps.is_empty() {
+                                                    println!("(no presets)");
+                                                } else {
+                                                    for (i, name) in ps.iter().enumerate() {
+                                                        println!("  [{}] {}", i + 1, name);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => cmd_err!("error: {}", e),
+                                        }
+                                    } else {
+                                        cmd_err!("invalid plugin id");
+                                    }
+                                }
+                                "select" => {
+                                    // plugin preset select <plugin_id> <preset_id>
+                                    // rebuild a pseudo-parts for parse_select_args compatibility is awkward; parse directly:
+                                    if parts.len() < 5 {
+                                        cmd_err!("usage: plugin preset select <plugin_id> <preset_id>");
+                                    } else if let (Ok(pid), Ok(preset)) = (parts[3].parse::<u32>(), parts[4].parse::<u32>()) {
+                                        if preset == 0 {
+                                            cmd_err!("preset id must be >= 1");
+                                        } else {
+                                            let mut mgr = manager().lock().unwrap();
+                                            match mgr.select_preset(pid, (preset - 1) as usize) {
+                                                Ok(_) => {
+                                                    let name = mgr.list_presets(pid).ok().and_then(|ps| ps.get((preset - 1) as usize).cloned()).unwrap_or_default();
+                                                    println!("selected preset {} for plugin {}: {}", preset, pid, name);
+                                                }
+                                                Err(e) => cmd_err!("error: {}", e),
+                                            }
+                                        }
+                                    } else {
+                                        cmd_err!("invalid ids");
+                                    }
+                                }
+                                "scan" => {
+                                    if parts.len() < 4 {
+                                        cmd_err!("usage: plugin preset scan <dir>");
+                                    } else {
+                                        let dir = PathBuf::from(&parts[3]);
+                                        scan_presets(&dir);
+                                    }
+                                }
+                                "load" => {
+                                    if parts.len() < 5 {
+                                        cmd_err!("usage: plugin preset load <plugin_id> <file>");
+                                    } else if let Ok(pid) = parts[3].parse::<u32>() {
+                                        let file = PathBuf::from(&parts[4]);
+                                        let mgr = manager().lock().unwrap();
+                                        let inst = mgr.get_instance(pid);
+                                        drop(mgr);
+                                        if let Some(inst) = inst {
+                                            let mut inst = inst.lock().unwrap();
+                                            match inst.load_preset_file(&file) {
+                                                Ok(_) => println!("loaded preset {}", file.display()),
+                                                Err(e) => cmd_err!("error: {}", e),
+                                            }
+                                        } else {
+                                            cmd_err!("plugin {} not found", pid);
+                                        }
+                                    } else {
+                                        cmd_err!("invalid plugin id");
+                                    }
+                                }
+                                "save" => {
+                                    if parts.len() < 5 {
+                                        cmd_err!("usage: plugin preset save <plugin_id> <file>");
+                                    } else if let Ok(pid) = parts[3].parse::<u32>() {
+                                        let file = PathBuf::from(&parts[4]);
+                                        let mgr = manager().lock().unwrap();
+                                        let inst = mgr.get_instance(pid);
+                                        drop(mgr);
+                                        if let Some(inst) = inst {
+                                            let inst = inst.lock().unwrap();
+                                            match inst.save_preset_file(&file) {
+                                                Ok(_) => println!("saved preset {}", file.display()),
+                                                Err(e) => cmd_err!("error: {}", e),
+                                            }
+                                        } else {
+                                            cmd_err!("plugin {} not found", pid);
+                                        }
+                                    } else {
+                                        cmd_err!("invalid plugin id");
+                                    }
+                                }
+                                other => cmd_err!("unknown preset action: {}", other),
+                            }
+                        }
+                    }
+                    "param" => {
+                        if parts.len() < 3 {
+                            cmd_err!("usage: plugin param <list|get|set> ...");
+                        } else {
+                            match parts[2].as_str() {
+                                "list" => {
+                                    if parts.len() < 4 {
+                                        cmd_err!("usage: plugin param list <plugin_id>");
+                                    } else if let Ok(pid) = parts[3].parse::<u32>() {
+                                        let mgr = manager().lock().unwrap();
+                                        let inst = mgr.get_instance(pid);
+                                        drop(mgr);
+                                        if let Some(inst) = inst {
+                                            let inst = inst.lock().unwrap();
+                                            let info = inst.info();
+                                            for p in &info.params {
+                                                let val = inst.get_param(p.index);
+                                                println!("  [{}] {} = {:.4} (range {}..{})", p.index, p.name, val, p.min, p.max);
+                                            }
+                                        } else {
+                                            cmd_err!("plugin {} not found", pid);
+                                        }
+                                    } else {
+                                        cmd_err!("invalid plugin id");
+                                    }
+                                }
+                                "get" => {
+                                    if parts.len() < 5 {
+                                        cmd_err!("usage: plugin param get <plugin_id> <index>");
+                                    } else if let (Ok(pid), Ok(idx)) = (parts[3].parse::<u32>(), parts[4].parse::<u32>()) {
+                                        let mgr = manager().lock().unwrap();
+                                        let inst = mgr.get_instance(pid);
+                                        drop(mgr);
+                                        if let Some(inst) = inst {
+                                            let inst = inst.lock().unwrap();
+                                            let val = inst.get_param(idx);
+                                            println!("{}", val);
+                                        } else {
+                                            cmd_err!("plugin {} not found", pid);
+                                        }
+                                    } else {
+                                        cmd_err!("invalid ids");
+                                    }
+                                }
+                                "set" => {
+                                    if parts.len() < 6 {
+                                        cmd_err!("usage: plugin param set <plugin_id> <index|volume> <value>");
+                                    } else if let (Ok(pid), Ok(val)) = (parts[3].parse::<u32>(), parts[5].parse::<f32>()) {
+                                        if parts[4] == "volume" {
+                                            let mgr = manager().lock().unwrap();
+                                            match mgr.set_gain(pid, val) {
+                                                Ok(_) => println!("volume set to {} for plugin {}", val, pid),
+                                                Err(e) => cmd_err!("error: {}", e),
+                                            }
+                                        } else if let Ok(idx) = parts[4].parse::<u32>() {
+                                            let mgr = manager().lock().unwrap();
+                                            let inst = mgr.get_instance(pid);
+                                            drop(mgr);
+                                            if let Some(inst) = inst {
+                                                let mut inst = inst.lock().unwrap();
+                                                inst.set_param(idx, val as f64);
+                                                println!("set param {} = {} for plugin {}", idx, val, pid);
+                                            } else {
+                                                cmd_err!("plugin {} not found", pid);
+                                            }
+                                        } else {
+                                            cmd_err!("invalid param index");
+                                        }
+                                    } else {
+                                        cmd_err!("invalid args");
+                                    }
+                                }
+                                other => cmd_err!("unknown param action: {}", other),
+                            }
+                        }
+                    }
+                    other => cmd_err!("unknown plugin action: {}", other),
+                }
+            }
+        }
+        "midi" => {
+            if parts.len() < 2 {
+                cmd_err!("usage: midi <list|listen|connect|disconnect> ...");
+            } else {
+                match parts[1].as_str() {
+                    "list" => match spaph_midi::list_input_ports() {
                         Ok(ps) => {
                             if ps.is_empty() {
                                 println!("(no midi input ports)");
@@ -432,7 +628,40 @@ fn run_line(line: &str) -> bool {
                         }
                         Err(e) => cmd_err!("error: {}", e),
                     },
-                    "audio" => match spaph_audio::list_devices() {
+                    "listen" => {
+                        if parts.len() < 3 {
+                            cmd_err!("usage: midi listen <port>");
+                        } else {
+                            if IN_SCRIPT.load(Ordering::Relaxed) {
+                                eprintln!("warning: 'midi listen' is interactive only; skipped in script");
+                            } else {
+                                midi_listen(&parts[2]);
+                            }
+                        }
+                    }
+                    "connect" => {
+                        if parts.len() < 4 {
+                            cmd_err!("usage: midi connect <port> <plugin_id>");
+                        } else if let Ok(pid) = parts[3].parse::<u32>() {
+                            midi_connect(parts[2].clone(), pid);
+                        } else {
+                            cmd_err!("invalid plugin id");
+                        }
+                    }
+                    "disconnect" => {
+                        cleanup_connections();
+                        println!("disconnected");
+                    }
+                    other => cmd_err!("unknown midi action: {}", other),
+                }
+            }
+        }
+        "audio" => {
+            if parts.len() < 2 {
+                cmd_err!("usage: audio <list|connect|disconnect> ...");
+            } else {
+                match parts[1].as_str() {
+                    "list" => match spaph_audio::list_devices() {
                         Ok(devs) => {
                             for d in devs {
                                 println!("{}", d);
@@ -440,46 +669,11 @@ fn run_line(line: &str) -> bool {
                         }
                         Err(e) => cmd_err!("error: {}", e),
                     },
-                    other => cmd_err!("unknown list target: {}", other),
-                }
-            }
-        }
-        "midi" => {
-            if parts.len() >= 3 && parts[1] == "listen" {
-                if IN_SCRIPT.load(Ordering::Relaxed) {
-                    eprintln!("warning: 'midi listen' is interactive only; skipped in script");
-                } else {
-                    midi_listen(&parts[2]);
-                }
-            } else {
-                cmd_err!("usage: midi listen <port>");
-            }
-        }
-        "unload" => {
-            if parts.len() < 2 {
-                cmd_err!("usage: unload <id>");
-            } else if let Ok(id) = parts[1].parse::<u32>() {
-                let mut mgr = manager().lock().unwrap();
-                match mgr.unload(id) {
-                    Ok(_) => println!("unloaded {}", id),
-                    Err(e) => cmd_err!("error: {}", e),
-                }
-            } else {
-                cmd_err!("invalid id");
-            }
-        }
-        "connect" => {
-            if parts.len() < 2 {
-                cmd_err!("usage: connect <audio|midi> ...");
-            } else {
-                match parts[1].as_str() {
-                    "audio" => {
+                    "connect" => {
                         if parts.len() < 3 {
-                            cmd_err!("usage: connect audio <plugin_id> [device_index] [sample_rate] [buffer_size]");
+                            cmd_err!("usage: audio connect <plugin_id> [device_index]");
                         } else if let Ok(pid) = parts[2].parse::<u32>() {
                             let dev_idx = parts.get(3).and_then(|s| s.parse::<usize>().ok());
-                            let sr = parts.get(4).and_then(|s| s.parse::<u32>().ok());
-                            let bs = parts.get(5).and_then(|s| s.parse::<u32>().ok());
                             let mgr = manager().lock().unwrap();
                             let inst = mgr.get_instance(pid);
                             let q = mgr.get_midi_queue(pid);
@@ -487,12 +681,10 @@ fn run_line(line: &str) -> bool {
                             drop(mgr);
                             let defaults = audio_defaults().lock().unwrap();
                             let dev_idx = dev_idx.or(defaults.device_index);
-                            let sr = sr.or(defaults.sample_rate);
-                            let bs = bs.or(defaults.buffer_size);
                             drop(defaults);
                             match (inst, q, gain) {
                                 (Some(inst), Some(q), Some(gain)) => {
-                                    match spaph_audio::start_audio(inst, q, dev_idx, sr, bs, gain) {
+                                    match spaph_audio::start_audio(inst, q, dev_idx, None, None, gain) {
                                         Ok(handle) => {
                                             *AUDIO_HANDLE.lock().unwrap() = Some(handle);
                                             println!("audio started for plugin {}", pid);
@@ -507,45 +699,16 @@ fn run_line(line: &str) -> bool {
                             cmd_err!("invalid plugin id");
                         }
                     }
-                    "midi" => {
-                        if parts.len() < 4 {
-                            cmd_err!("usage: connect midi <port> <plugin_id>");
-                        } else if let Ok(pid) = parts[3].parse::<u32>() {
-                            midi_connect(parts[2].clone(), pid);
-                        } else {
-                            cmd_err!("invalid plugin id");
-                        }
+                    "disconnect" => {
+                        *AUDIO_HANDLE.lock().unwrap() = None;
+                        println!("audio disconnected");
                     }
-                    other => cmd_err!("unknown connect target: {}", other),
-                }
-            }
-        }
-        "disconnect" => {
-            cleanup_connections();
-            println!("disconnected");
-        }
-        "select" => {
-            match parse_select_args(&parts) {
-                None => cmd_err!("usage: select <plugin_id> <preset_id>  (or: select preset <plugin_id> <preset_id>)"),
-                Some((pid, preset)) => {
-                    if preset == 0 {
-                        cmd_err!("preset id must be >= 1");
-                    } else {
-                        let mut mgr = manager().lock().unwrap();
-                        match mgr.select_preset(pid, (preset - 1) as usize) {
-                            Ok(_) => {
-                                let name = mgr.list_presets(pid).ok().and_then(|ps| ps.get((preset - 1) as usize).cloned()).unwrap_or_default();
-                                println!("selected preset {} for plugin {}: {}", preset, pid, name);
-                            }
-                            Err(e) => cmd_err!("error: {}", e),
-                        }
-                    }
+                    other => cmd_err!("unknown audio action: {}", other),
                 }
             }
         }
         "volume" => {
             if parts.len() == 2 {
-                // volume <level> -> active plugin
                 if let Ok(level) = parts[1].parse::<f32>() {
                     let active = *ACTIVE_AUDIO_PLUGIN.lock().unwrap();
                     match active {
@@ -575,173 +738,30 @@ fn run_line(line: &str) -> bool {
                 cmd_err!("usage: volume [<plugin_id>] <level>");
             }
         }
-        "param" => {
-            if parts.len() < 2 {
-                cmd_err!("usage: param <list|get|set> ...");
-            } else {
-                match parts[1].as_str() {
-                    "list" => {
-                        if parts.len() < 3 {
-                            cmd_err!("usage: param list <plugin_id>");
-                        } else if let Ok(pid) = parts[2].parse::<u32>() {
-                            let mgr = manager().lock().unwrap();
-                            let inst = mgr.get_instance(pid);
-                            drop(mgr);
-                            if let Some(inst) = inst {
-                                let inst = inst.lock().unwrap();
-                                let info = inst.info();
-                                for p in &info.params {
-                                    let val = inst.get_param(p.index);
-                                    println!("  [{}] {} = {:.4} (range {}..{})", p.index, p.name, val, p.min, p.max);
-                                }
-                            } else {
-                                cmd_err!("plugin {} not found", pid);
-                            }
-                        } else {
-                            cmd_err!("invalid plugin id");
-                        }
-                    }
-                    "get" => {
-                        if parts.len() < 4 {
-                            cmd_err!("usage: param get <plugin_id> <index>");
-                        } else if let (Ok(pid), Ok(idx)) = (parts[2].parse::<u32>(), parts[3].parse::<u32>()) {
-                            let mgr = manager().lock().unwrap();
-                            let inst = mgr.get_instance(pid);
-                            drop(mgr);
-                            if let Some(inst) = inst {
-                                let inst = inst.lock().unwrap();
-                                let val = inst.get_param(idx);
-                                println!("{}", val);
-                            } else {
-                                cmd_err!("plugin {} not found", pid);
-                            }
-                        } else {
-                            cmd_err!("invalid ids");
-                        }
-                    }
-                    "set" => {
-                        if parts.len() < 5 {
-                            cmd_err!("usage: param set <plugin_id> <index|volume> <value>");
-                        } else if let (Ok(pid), Ok(val)) = (parts[2].parse::<u32>(), parts[4].parse::<f32>()) {
-                            if parts[3] == "volume" {
-                                let mgr = manager().lock().unwrap();
-                                match mgr.set_gain(pid, val) {
-                                    Ok(_) => println!("volume set to {} for plugin {}", val, pid),
-                                    Err(e) => cmd_err!("error: {}", e),
-                                }
-                            } else if let Ok(idx) = parts[3].parse::<u32>() {
-                                let mgr = manager().lock().unwrap();
-                                let inst = mgr.get_instance(pid);
-                                drop(mgr);
-                                if let Some(inst) = inst {
-                                    let mut inst = inst.lock().unwrap();
-                                    inst.set_param(idx, val as f64);
-                                    println!("set param {} = {} for plugin {}", idx, val, pid);
-                                } else {
-                                    cmd_err!("plugin {} not found", pid);
-                                }
-                            } else {
-                                cmd_err!("invalid param index");
-                            }
-                        } else {
-                            cmd_err!("invalid args");
-                        }
-                    }
-                    other => cmd_err!("unknown param action: {}", other),
-                }
-            }
-        }
-        "preset" => {
-            if parts.len() < 2 {
-                cmd_err!("usage: preset <scan|load|save> ...");
-            } else {
-                match parts[1].as_str() {
-                    "save" => {
-                        if parts.len() < 4 {
-                            cmd_err!("usage: preset save <plugin_id> <file>");
-                        } else if let Ok(pid) = parts[2].parse::<u32>() {
-                            let file = PathBuf::from(&parts[3]);
-                            let mgr = manager().lock().unwrap();
-                            let inst = mgr.get_instance(pid);
-                            drop(mgr);
-                            if let Some(inst) = inst {
-                                let inst = inst.lock().unwrap();
-                                match inst.save_preset_file(&file) {
-                                    Ok(_) => println!("saved preset {}", file.display()),
-                                    Err(e) => cmd_err!("error: {}", e),
-                                }
-                            } else {
-                                cmd_err!("plugin {} not found", pid);
-                            }
-                        } else {
-                            cmd_err!("invalid plugin id");
-                        }
-                    }
-                    "scan" => {
-                        if parts.len() < 3 {
-                            cmd_err!("usage: preset scan <dir>");
-                        } else {
-                            let dir = PathBuf::from(&parts[2]);
-                            scan_presets(&dir);
-                        }
-                    }
-                    "load" => {
-                        if parts.len() < 4 {
-                            cmd_err!("usage: preset load <plugin_id> <file>");
-                        } else if let Ok(pid) = parts[2].parse::<u32>() {
-                            let file = PathBuf::from(&parts[3]);
-                            let mgr = manager().lock().unwrap();
-                            let inst = mgr.get_instance(pid);
-                            drop(mgr);
-                            if let Some(inst) = inst {
-                                let mut inst = inst.lock().unwrap();
-                                match inst.load_preset_file(&file) {
-                                    Ok(_) => println!("loaded preset {}", file.display()),
-                                    Err(e) => cmd_err!("error: {}", e),
-                                }
-                            } else {
-                                cmd_err!("plugin {} not found", pid);
-                            }
-                        } else {
-                            cmd_err!("invalid plugin id");
-                        }
-                    }
-                    other => cmd_err!("unknown preset action: {}", other),
-                }
-            }
-        }
-        "show" => {
-            if parts.len() < 2 {
-                cmd_err!("usage: show <plugin_id>");
-            } else if let Ok(pid) = parts[1].parse::<u32>() {
-                let mgr = manager().lock().unwrap();
-                let inst = mgr.get_instance(pid);
-                drop(mgr);
-                if let Some(inst) = inst {
-                    let mut inst = inst.lock().unwrap();
-                    if !inst.has_editor() {
-                        cmd_err!("plugin {} has no editor", pid);
-                    } else {
-                        println!("opening editor for plugin {} (close window to continue)", pid);
-                        if let Err(e) = inst.open_editor() {
-                            cmd_err!("error: {}", e);
-                        }
-                    }
+        "master" => {
+            if parts.len() == 2 {
+                if let Ok(level) = parts[1].parse::<f32>() {
+                    spaph_audio::set_master_gain(level);
+                    println!("master volume set to {}", level);
                 } else {
-                    cmd_err!("plugin {} not found", pid);
+                    cmd_err!("usage: master <level>");
                 }
             } else {
-                cmd_err!("invalid plugin id");
+                cmd_err!("usage: master <level>");
             }
+        }
+        "disconnect" => {
+            cleanup_connections();
+            println!("disconnected");
         }
         "quit" | "exit" => {
-            // In a script, quit only ends the script; the program keeps running.
             return false;
         }
         other => cmd_err!("unknown command: {}", other),
     }
     true
 }
+
 
 fn run_shell(osc_port: u16) {
     let mut rl = match DefaultEditor::new() {
@@ -906,7 +926,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_select_args, split_args};
+    use super::split_args;
 
     #[test]
     fn split_simple() {
@@ -914,52 +934,31 @@ mod tests {
     }
 
     #[test]
+    fn split_quoted_path_with_spaces() {
+        assert_eq!(
+            split_args("plugin load \"/usr/lib/vst3/Surge XT.vst3\""),
+            vec!["plugin".to_string(), "load".to_string(), "/usr/lib/vst3/Surge XT.vst3".to_string()]
+        );
+    }
+
+    #[test]
     fn split_single_quoted_path_with_spaces() {
         assert_eq!(
-            split_args("load '/usr/lib/vst3/Surge XT.vst3'"),
-            vec!["load".to_string(), "/usr/lib/vst3/Surge XT.vst3".to_string()]
+            split_args("plugin load '/usr/lib/vst3/Surge XT.vst3'"),
+            vec!["plugin".to_string(), "load".to_string(), "/usr/lib/vst3/Surge XT.vst3".to_string()]
         );
     }
 
     #[test]
     fn split_apostrophe_inside_double_quotes() {
         assert_eq!(
-            split_args("load \"it's here\""),
-            vec!["load".to_string(), "it's here".to_string()]
+            split_args("plugin load \"it's here\""),
+            vec!["plugin".to_string(), "load".to_string(), "it's here".to_string()]
         );
     }
 
     #[test]
-    fn split_double_quote_inside_single_quotes() {
-        assert_eq!(
-            split_args("preset load 1 '/tmp/say \"hi\".fxp'"),
-            vec!["preset".to_string(), "load".to_string(), "1".to_string(), "/tmp/say \"hi\".fxp".to_string()]
-        );
-    }
-
-    #[test]
-    fn split_quoted_path_with_spaces() {
-        assert_eq!(
-            split_args("load \"/usr/lib/vst3/Surge XT.vst3\""),
-            vec!["load".to_string(), "/usr/lib/vst3/Surge XT.vst3".to_string()]
-        );
-    }
-
-    #[test]
-    fn parse_select_simple() {
-        let parts = split_args("select 1 5");
-        assert_eq!(parse_select_args(&parts), Some((1, 5)));
-    }
-
-    #[test]
-    fn parse_select_preset_keyword() {
-        let parts = split_args("select preset 1 5");
-        assert_eq!(parse_select_args(&parts), Some((1, 5)));
-    }
-
-    #[test]
-    fn parse_select_invalid() {
-        let parts = split_args("select foo bar");
-        assert_eq!(parse_select_args(&parts), None);
+    fn split_empty() {
+        assert!(split_args("   ").is_empty());
     }
 }

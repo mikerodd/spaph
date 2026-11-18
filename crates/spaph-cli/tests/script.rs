@@ -21,7 +21,7 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn failing_script_line_exits_nonzero_with_location() {
     let dir = scratch("fail");
-    std::fs::write(dir.join("s.spaph"), "# comment\nload /no/such/plugin.so\nlist plugins\n").unwrap();
+    std::fs::write(dir.join("s.spaph"), "# comment\nplugin load /no/such/plugin.so\nplugin list\n").unwrap();
     std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
 
     let out = spaph()
@@ -118,7 +118,7 @@ fn missing_explicit_config_exits_with_message() {
 fn connect_audio_with_unknown_plugin_id_reports_error_without_panic() {
     // Regression: `connect audio 0 1` (id 0 does not exist) used to panic.
     let dir = scratch("badid");
-    std::fs::write(dir.join("s.spaph"), "connect audio 0 1\n").unwrap();
+    std::fs::write(dir.join("s.spaph"), "audio connect 0 1\n").unwrap();
     std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
 
     let out = spaph()

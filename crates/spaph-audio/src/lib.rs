@@ -3,6 +3,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use spaph_plugin::PluginInstance;
 use spaph_types::{MidiEvent, Result, SpaphError};
+
+static MASTER_GAIN: std::sync::Mutex<f32> = std::sync::Mutex::new(1.0);
 use std::sync::{Arc, Mutex};
 
 pub fn list_devices() -> Result<Vec<String>> {
@@ -16,6 +18,14 @@ pub fn list_devices() -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+pub fn set_master_gain(value: f32) {
+    *MASTER_GAIN.lock().unwrap() = value;
+}
+
+pub fn get_master_gain() -> f32 {
+    *MASTER_GAIN.lock().unwrap()
 }
 
 pub struct AudioHandle {
@@ -126,6 +136,7 @@ pub fn start_audio(
         }
 
         let gain_val = *gain_cb.lock().unwrap();
+        let master_val = *MASTER_GAIN.lock().unwrap();
         for f in 0..frames {
             for c in 0..channels {
                 let src_ch = if plugin_outputs > 0 {
@@ -134,7 +145,7 @@ pub fn start_audio(
                     0
                 };
                 if src_ch < scratch.len() {
-                    data[f * channels + c] = scratch[src_ch][f] * gain_val;
+                    data[f * channels + c] = scratch[src_ch][f] * gain_val * master_val;
                 }
             }
         }
