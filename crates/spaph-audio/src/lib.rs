@@ -35,7 +35,13 @@ pub fn backend_list() -> Vec<(String, bool, bool)> {
     let current = cpal::default_host().id();
     let mut out = Vec::new();
     for id in cpal::available_hosts() {
-        let available = cpal::host_from_id(id).is_ok();
+        // Probing JACK creates a connection attempt to jackd and floods stderr
+        // when no server is running; report it as available without probing.
+        let available = if id.name().eq_ignore_ascii_case("jack") {
+            true
+        } else {
+            cpal::host_from_id(id).is_ok()
+        };
         out.push((id.name().to_string(), available, id == current));
     }
     out
