@@ -176,6 +176,55 @@ unsafe impl Send for StreamSlot {}
 
 static STREAM: Mutex<Option<StreamSlot>> = Mutex::new(None);
 
+/// Renders one block of interleaved f32 samples.
+type Render = Arc<dyn Fn(&mut [f32]) + Send + Sync>;
+
+fn stream_error(e: cpal::Error) {
+    tracing::error!("audio stream error: {}", e);
+}
+
+/// Open an output stream whose samples have type `T`. The f32 block from `render` is
+/// converted per callback, so devices that only accept integer samples (e.g. ASIO4ALL, i32)
+/// work the same as f32 devices.
+fn open_stream_typed<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    render: Render,
+) -> std::result::Result<cpal::Stream, cpal::Error>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let mut scratch: Vec<f32> = Vec::new();
+    device.build_output_stream::<T, _, _>(
+        config.clone(),
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            scratch.resize(data.len(), 0.0);
+            render(&mut scratch);
+            for (out, sample) in data.iter_mut().zip(scratch.iter()) {
+                *out = T::from_sample(*sample);
+            }
+        },
+        stream_error,
+        None,
+    )
+}
+
+fn open_stream(
+    device: &cpal::Device,
+    format: cpal::SampleFormat,
+    config: &cpal::StreamConfig,
+    render: Render,
+) -> Result<cpal::Stream> {
+    let result = match format {
+        cpal::SampleFormat::F32 => open_stream_typed::<f32>(device, config, render),
+        cpal::SampleFormat::I32 => open_stream_typed::<i32>(device, config, render),
+        cpal::SampleFormat::I16 => open_stream_typed::<i16>(device, config, render),
+        cpal::SampleFormat::U16 => open_stream_typed::<u16>(device, config, render),
+        other => return Err(SpaphError::Audio(format!("unsupported sample format {:?}", other))),
+    };
+    result.map_err(|e| SpaphError::Audio(e.to_string()))
+}
+
 pub fn start_stream() -> Result<()> {
     let mut slot = STREAM.lock().unwrap();
     if slot.is_some() {
@@ -191,12 +240,15 @@ pub fn start_stream() -> Result<()> {
     };
     let sample_rate = get_sample_rate();
     let buffer_size = get_buffer_size();
-    let channels = device.default_output_config().map_err(|e| SpaphError::Audio(e.to_string()))?.channels() as usize;
+    let default_cfg = device.default_output_config().map_err(|e| SpaphError::Audio(e.to_string()))?;
+    let channels = default_cfg.channels() as usize;
+    let sample_format = default_cfg.sample_format();
 
     let active = active_list();
     let channels_c = channels;
 
-    let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+    // Renders one block as f32; converted to the device's sample format by `open_stream`.
+    let render = move |data: &mut [f32]| {
         data.fill(0.0);
         let frames = if channels_c > 0 { data.len() / channels_c } else { 0 };
         if frames == 0 {
@@ -251,10 +303,7 @@ pub fn start_stream() -> Result<()> {
             }
         }
     };
-
-    let err_fn = |e| {
-        tracing::error!("audio stream error: {}", e);
-    };
+    let render: Render = Arc::new(render);
 
     // An explicit buffer size bounds latency. With BufferSize::Default, PipeWire-ALSA may pick
     // very large periods (cpal's ALSA backend notes this), which shows up as seconds of delay.
@@ -270,16 +319,18 @@ pub fn start_stream() -> Result<()> {
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let stream = match device.build_output_stream(fixed_config, data_fn.clone(), err_fn, None) {
+    let open = |config: &cpal::StreamConfig| open_stream(&device, sample_format, config, render.clone());
+    let stream = match open(&fixed_config) {
         Ok(s) => {
-            tracing::info!("audio stream: {} Hz, {} channels, buffer {} frames", sample_rate, channels, buffer_size);
+            tracing::info!(
+                "audio stream: {} Hz, {} channels, {:?} samples, buffer {} frames",
+                sample_rate, channels, sample_format, buffer_size
+            );
             s
         }
         Err(e) => {
             tracing::warn!("fixed buffer {} not accepted ({}); using device default buffer", buffer_size, e);
-            device
-                .build_output_stream(default_config, data_fn, err_fn, None)
-                .map_err(|e| SpaphError::Audio(e.to_string()))?
+            open(&default_config).map_err(|e| SpaphError::Audio(e.to_string()))?
         }
     };
     stream.play().map_err(|e| SpaphError::Audio(e.to_string()))?;
