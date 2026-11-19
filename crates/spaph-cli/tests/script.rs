@@ -217,3 +217,22 @@ fn plugin_show_without_id_prints_usage() {
     assert!(err.contains("usage: plugin show <plugin_id>"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn plugin_preset_save_unknown_id_reports_error_without_panic() {
+    let dir = scratch("psave");
+    std::fs::write(dir.join("s.spaph"), "plugin preset save 99 out.fxp\n").unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic: {err}");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(err.contains("plugin 99 not found"), "{err}");
+    assert!(!dir.join("out.fxp").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

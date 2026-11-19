@@ -759,8 +759,7 @@ impl PluginParameters for PluginParametersInstance {
             &mut ptr as *mut *mut u8 as *mut c_void,
             0.0,
         );
-        let slice = unsafe { slice::from_raw_parts(ptr, len as usize) };
-        slice.to_vec()
+        chunk_from_raw(ptr, len)
     }
 
     fn get_bank_data(&self) -> Vec<u8> {
@@ -773,8 +772,7 @@ impl PluginParameters for PluginParametersInstance {
             &mut ptr as *mut *mut u8 as *mut c_void,
             0.0,
         );
-        let slice = unsafe { slice::from_raw_parts(ptr, len as usize) };
-        slice.to_vec()
+        chunk_from_raw(ptr, len)
     }
 
     fn load_preset_data(&self, data: &[u8]) {
@@ -946,6 +944,37 @@ extern "C" fn callback_wrapper<T: Host>(
 
             interfaces::host_dispatch(host, effect, opcode, index, value, ptr, opt)
         }
+    }
+}
+
+/// Copy chunk data returned by `effGetChunk`.
+///
+/// Plugins that have no chunk return a null pointer or a non-positive length; building a slice
+/// from those is undefined behaviour, so they yield an empty vector.
+fn chunk_from_raw(ptr: *const u8, len: isize) -> Vec<u8> {
+    if ptr.is_null() || len <= 0 {
+        return Vec::new();
+    }
+    unsafe { slice::from_raw_parts(ptr, len as usize) }.to_vec()
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::chunk_from_raw;
+    #[test]
+    fn null_chunk_is_empty() {
+        assert!(chunk_from_raw(std::ptr::null(), 16).is_empty());
+    }
+    #[test]
+    fn non_positive_length_is_empty() {
+        let data = [1u8, 2, 3];
+        assert!(chunk_from_raw(data.as_ptr(), 0).is_empty());
+        assert!(chunk_from_raw(data.as_ptr(), -1).is_empty());
+    }
+    #[test]
+    fn copies_chunk_bytes() {
+        let data = [7u8, 8, 9];
+        assert_eq!(chunk_from_raw(data.as_ptr(), 3), vec![7, 8, 9]);
     }
 }
 

@@ -8,6 +8,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 mod editor;
+mod fxp;
+
+use fxp::{Body, Fxp};
 use vst::host::{Host, PluginLoader};
 use vst::editor::Editor;
 use vst::plugin::{Info as VstInfo, Plugin, PluginParameters};
@@ -76,6 +79,8 @@ impl PluginFactory for Vst2Factory {
         Ok(Box::new(Vst2Instance {
             info,
             params,
+            fx_id: vst_info.unique_id,
+            fx_version: vst_info.version,
             // Declared before `_instance` so the editor is dropped first.
             editor,
             _instance: inst,
@@ -87,6 +92,8 @@ impl PluginFactory for Vst2Factory {
 pub struct Vst2Instance {
     info: SpaphPluginInfo,
     params: Arc<dyn PluginParameters>,
+    fx_id: i32,
+    fx_version: i32,
     editor: Option<Box<dyn Editor>>,
     _instance: vst::host::PluginInstance,
     sample_rate: f64,
@@ -188,8 +195,8 @@ impl SpaphPluginInstance for Vst2Instance {
 
     fn load_preset_file(&mut self, path: &std::path::Path) -> Result<()> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        if ext == "fxp" || ext == "fxb" {
-            return Err(SpaphError::Plugin(".fxp/.fxb loading requires parsing the VST2 preset container; not implemented yet".into()));
+        if ext == "fxb" {
+            return Err(SpaphError::Plugin("VST2 bank files (.fxb) are not supported yet; use .fxp".into()));
         }
         let data = std::fs::read(path).map_err(|e| SpaphError::Plugin(e.to_string()))?;
         self.load_state(&data)
@@ -221,10 +228,50 @@ impl SpaphPluginInstance for Vst2Instance {
     fn set_param(&mut self, index: u32, value: f64) {
         self.params.set_parameter(index as i32, value as f32);
     }
+    /// Current program as `.fxp` bytes: the opaque chunk when the plugin provides one,
+    /// otherwise its parameter values.
     fn save_state(&self) -> Result<Vec<u8>> {
-        Err(SpaphError::Plugin("state save not implemented for VST2".into()))
+        let chunk = self.params.get_preset_data();
+        let body = if chunk.is_empty() {
+            let values = (0..self.info.params.len() as i32)
+                .map(|i| self.params.get_parameter(i))
+                .collect();
+            Body::Params(values)
+        } else {
+            Body::Chunk(chunk)
+        };
+        let program = Fxp {
+            fx_id: self.fx_id,
+            fx_version: self.fx_version,
+            name: self.params.get_current_preset_name(),
+            body,
+        };
+        Ok(fxp::encode(&program))
     }
-    fn load_state(&mut self, _data: &[u8]) -> Result<()> {
-        Err(SpaphError::Plugin("state load not implemented for VST2".into()))
+
+    fn load_state(&mut self, data: &[u8]) -> Result<()> {
+        let program = fxp::decode(data).map_err(SpaphError::Plugin)?;
+        if program.fx_id != self.fx_id {
+            return Err(SpaphError::Plugin(format!(
+                "preset was saved for plugin id {:#x}, this plugin is {:#x}",
+                program.fx_id, self.fx_id
+            )));
+        }
+        match program.body {
+            Body::Chunk(chunk) => self.params.load_preset_data(&chunk),
+            Body::Params(values) => {
+                if values.len() != self.info.params.len() {
+                    return Err(SpaphError::Plugin(format!(
+                        "preset has {} parameters, plugin has {}",
+                        values.len(),
+                        self.info.params.len()
+                    )));
+                }
+                for (i, v) in values.into_iter().enumerate() {
+                    self.params.set_parameter(i as i32, v);
+                }
+            }
+        }
+        Ok(())
     }
 }
