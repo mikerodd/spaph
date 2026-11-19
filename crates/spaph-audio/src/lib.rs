@@ -230,8 +230,10 @@ pub fn start_stream() -> Result<()> {
                 .map(|mut q| std::mem::take(&mut *q))
                 .unwrap_or_default();
             midi_stats::on_delivered(&events);
-            for ev in &events {
-                inst.handle_midi(ev);
+            // One batch per block: VST2 plugins expect all events of a block in a single
+            // effProcessEvents call; sending them one by one can drop earlier events.
+            if !events.is_empty() {
+                inst.handle_midi_events(&events);
             }
             let mut scratch = vec![vec![0.0f32; frames]; po];
             let mut out_refs: Vec<&mut [f32]> = scratch.iter_mut().map(|v| v.as_mut_slice()).collect();
