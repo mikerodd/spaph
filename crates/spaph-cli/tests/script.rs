@@ -181,3 +181,39 @@ fn midi_disconnect_all_in_script_ok() {
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn plugin_show_unknown_id_reports_error_without_panic() {
+    // `plugin show` works for VST2 and VST3; an unknown id must report an error, not panic.
+    let dir = scratch("pshow");
+    std::fs::write(dir.join("s.spaph"), "plugin show 99\n").unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic: {err}");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(err.contains("plugin 99 not found"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plugin_show_without_id_prints_usage() {
+    let dir = scratch("pshowu");
+    std::fs::write(dir.join("s.spaph"), "plugin show\n").unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic: {err}");
+    assert!(err.contains("usage: plugin show <plugin_id>"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

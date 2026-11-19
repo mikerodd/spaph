@@ -96,15 +96,21 @@ pub fn disarm_all() {
 }
 
 // ---------------------------------------------------------------------------
-// Thread-local stream
+// Output stream (process-wide, so any thread such as the OSC server can restart it)
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    static STREAM: std::cell::RefCell<Option<cpal::Stream>> = std::cell::RefCell::new(None);
-}
+// The stream is kept only so it stays alive; it is never read.
+struct StreamSlot(#[allow(dead_code)] cpal::Stream);
+
+// SAFETY: the stream is only created, replaced or dropped while holding STREAM's lock.
+// cpal drives its callback on its own thread; this handle is never used for audio work.
+unsafe impl Send for StreamSlot {}
+
+static STREAM: Mutex<Option<StreamSlot>> = Mutex::new(None);
 
 pub fn start_stream() -> Result<()> {
-    if STREAM.with(|s| s.borrow().is_some()) {
+    let mut slot = STREAM.lock().unwrap();
+    if slot.is_some() {
         return Ok(());
     }
     ensure_pulse_prop();
@@ -121,7 +127,6 @@ pub fn start_stream() -> Result<()> {
 
     let active = active_list();
     let channels_c = channels;
-    let buffer_size_c = buffer_size;
 
     let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
         data.fill(0.0);
@@ -148,7 +153,6 @@ pub fn start_stream() -> Result<()> {
                 Ok(g) => g,
                 Err(_) => continue,
             };
-            inst.set_block_size(buffer_size_c);
             for ev in &events {
                 inst.handle_midi(ev);
             }
@@ -173,26 +177,60 @@ pub fn start_stream() -> Result<()> {
         tracing::error!("audio stream error: {}", e);
     };
 
-    let stream_config = cpal::StreamConfig {
+    // An explicit buffer size bounds latency. With BufferSize::Default, PipeWire-ALSA may pick
+    // very large periods (cpal's ALSA backend notes this), which shows up as seconds of delay.
+    // Fall back to Default only if the device refuses the requested size.
+    let fixed_config = cpal::StreamConfig {
+        channels: channels as u16,
+        sample_rate: sample_rate,
+        buffer_size: cpal::BufferSize::Fixed(buffer_size as u32),
+    };
+    let default_config = cpal::StreamConfig {
         channels: channels as u16,
         sample_rate: sample_rate,
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let stream = device
-        .build_output_stream(stream_config, data_fn, err_fn, None)
-        .map_err(|e| SpaphError::Audio(e.to_string()))?;
+    let stream = match device.build_output_stream(fixed_config, data_fn.clone(), err_fn, None) {
+        Ok(s) => {
+            tracing::info!("audio stream: {} Hz, {} channels, buffer {} frames", sample_rate, channels, buffer_size);
+            s
+        }
+        Err(e) => {
+            tracing::warn!("fixed buffer {} not accepted ({}); using device default buffer", buffer_size, e);
+            device
+                .build_output_stream(default_config, data_fn, err_fn, None)
+                .map_err(|e| SpaphError::Audio(e.to_string()))?
+        }
+    };
     stream.play().map_err(|e| SpaphError::Audio(e.to_string()))?;
-    STREAM.with(|s| *s.borrow_mut() = Some(stream));
+    *slot = Some(StreamSlot(stream));
     Ok(())
 }
 
 pub fn stop_stream() {
-    STREAM.with(|s| { *s.borrow_mut() = None; });
+    *STREAM.lock().unwrap() = None;
 }
 
 pub fn is_running() -> bool {
-    STREAM.with(|s| s.borrow().is_some())
+    STREAM.lock().unwrap().is_some()
+}
+
+/// Switch the output stream to the device at `index` (None = system default).
+/// Restarts the stream if needed; on failure the previous device is restored.
+pub fn set_output_device(index: Option<usize>) -> Result<()> {
+    let previous = get_device_index();
+    if previous == index && is_running() {
+        return Ok(());
+    }
+    stop_stream();
+    set_device_index(index);
+    if let Err(e) = start_stream() {
+        set_device_index(previous);
+        let _ = start_stream();
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub fn ensure_engine(sample_rate: Option<u32>, buffer_size: Option<u32>, device_index: Option<usize>) -> Result<()> {
@@ -214,12 +252,15 @@ pub fn start_stream_with(sample_rate: Option<u32>, buffer_size: Option<u32>, dev
 pub fn list_devices() -> Result<Vec<String>> {
     ensure_pulse_prop();
     let host = cpal::default_host();
+    // Keep every device (even unnamed ones) so positions match the indices used by start_stream.
     let mut out = Vec::new();
     if let Ok(devs) = host.output_devices() {
         for d in devs {
-            if let Ok(desc) = d.description() {
-                out.push(desc.name().to_string());
-            }
+            let name = d
+                .description()
+                .map(|desc| desc.name().to_string())
+                .unwrap_or_else(|_| "(unnamed device)".to_string());
+            out.push(name);
         }
     }
     Ok(out)

@@ -6,7 +6,10 @@ use spaph_plugin::{ParamInfo, PluginFactory, PluginInfo as SpaphPluginInfo, Plug
 use spaph_types::{MidiEvent, PluginFormat, Result, SpaphError};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+mod editor;
 use vst::host::{Host, PluginLoader};
+use vst::editor::Editor;
 use vst::plugin::{Info as VstInfo, Plugin, PluginParameters};
 
 pub struct Vst2Host {
@@ -34,6 +37,10 @@ impl PluginFactory for Vst2Factory {
         let mut loader = PluginLoader::load(path, host.clone())
             .map_err(|e| SpaphError::Plugin(e.to_string()))?;
         let mut inst = loader.instance().map_err(|e| SpaphError::Plugin(e.to_string()))?;
+        // The VST2 SDK has no "has editor" query on the host side; a plugin without a GUI
+        // reports an empty editor rect. get_editor() can only be called once per instance,
+        // so keep the editor for the lifetime of the plugin.
+        let editor = inst.get_editor().filter(|e| e.size() != (0, 0));
         let vst_info: VstInfo = inst.get_info();
         let params = inst.get_parameter_object();
         let num = vst_info.parameters.max(0) as u32;
@@ -69,6 +76,8 @@ impl PluginFactory for Vst2Factory {
         Ok(Box::new(Vst2Instance {
             info,
             params,
+            // Declared before `_instance` so the editor is dropped first.
+            editor,
             _instance: inst,
             sample_rate: 48000.0,
         }))
@@ -78,6 +87,7 @@ impl PluginFactory for Vst2Factory {
 pub struct Vst2Instance {
     info: SpaphPluginInfo,
     params: Arc<dyn PluginParameters>,
+    editor: Option<Box<dyn Editor>>,
     _instance: vst::host::PluginInstance,
     sample_rate: f64,
 }
@@ -186,11 +196,17 @@ impl SpaphPluginInstance for Vst2Instance {
     }
 
     fn has_editor(&self) -> bool {
-        false
+        self.editor.is_some()
     }
 
     fn open_editor(&mut self) -> Result<()> {
-        Err(SpaphError::Plugin("VST2 editor not supported yet".into()))
+        let editor = self
+            .editor
+            .as_mut()
+            .ok_or_else(|| SpaphError::Plugin("plugin has no editor".into()))?;
+        let (width, height) = editor.size();
+        let mut window = editor::open_window(&self.info.name, width, height)?;
+        editor::run_editor(editor.as_mut(), window.as_mut())
     }
 
     fn save_preset_file(&self, path: &std::path::Path) -> Result<()> {

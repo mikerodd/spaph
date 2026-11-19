@@ -141,7 +141,7 @@ fn print_help() {
     println!("  plugin load <path>            Load a plugin and display its interface");
     println!("  plugin list                   List loaded plugins");
     println!("  plugin unload <id>            Unload a plugin by id");
-    println!("  plugin show <id>              Show plugin editor UI (VST3)");
+    println!("  plugin show <id>              Show plugin editor UI (VST2 and VST3)");
     println!("  plugin preset list <id>       List presets of a plugin");
     println!("  plugin preset select <id> <n> Select a preset (1-based)");
     println!("  plugin preset scan <dir>      Scan a directory for preset files");
@@ -471,6 +471,35 @@ fn stdin_thread_slot() -> &'static std::sync::Mutex<Option<std::thread::JoinHand
     STDIN_THREAD.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+// Saved terminal state, captured before rustyline puts the terminal in raw mode.
+#[cfg(unix)]
+static SAVED_TERM: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+#[cfg(windows)]
+static SAVED_CONSOLE_MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+fn save_terminal() {
+    #[cfg(unix)]
+    unsafe {
+        if libc::isatty(0) != 0 {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) == 0 {
+                let _ = SAVED_TERM.set(t);
+            }
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        use winapi::um::consoleapi::GetConsoleMode;
+        use winapi::um::processenv::GetStdHandle;
+        use winapi::um::winbase::STD_INPUT_HANDLE;
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            let _ = SAVED_CONSOLE_MODE.set(mode);
+        }
+    }
+}
+
 fn close_stdin() {
     #[cfg(unix)]
     unsafe {
@@ -490,7 +519,11 @@ fn restore_terminal() {
     #[cfg(unix)]
     unsafe {
         if libc::isatty(0) != 0 {
-            let _ = std::process::Command::new("stty").arg("sane").status();
+            if let Some(t) = SAVED_TERM.get() {
+                libc::tcsetattr(0, libc::TCSANOW, t);
+            } else {
+                let _ = std::process::Command::new("stty").arg("sane").status();
+            }
         }
     }
     #[cfg(windows)]
@@ -498,11 +531,10 @@ fn restore_terminal() {
         use winapi::um::consoleapi::SetConsoleMode;
         use winapi::um::processenv::GetStdHandle;
         use winapi::um::winbase::STD_INPUT_HANDLE;
-        use winapi::um::wincon::ENABLE_ECHO_INPUT;
-        use winapi::um::wincon::ENABLE_LINE_INPUT;
-        use winapi::um::wincon::ENABLE_PROCESSED_INPUT;
         let handle = GetStdHandle(STD_INPUT_HANDLE);
-        SetConsoleMode(handle, ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+        if let Some(mode) = SAVED_CONSOLE_MODE.get() {
+            SetConsoleMode(handle, *mode);
+        }
     }
 }
 
@@ -934,8 +966,11 @@ fn run_line(line: &str) -> bool {
                 match parts[1].as_str() {
                     "list" => match spaph_audio::list_devices() {
                         Ok(devs) => {
-                            for d in devs {
-                                println!("{}", d);
+                            if devs.is_empty() {
+                                println!("(no audio output devices)");
+                            }
+                            for (i, d) in devs.iter().enumerate() {
+                                println!("  [{}] {}", i, d);
                             }
                         }
                         Err(e) => cmd_err!("error: {}", e),
@@ -955,17 +990,20 @@ fn run_line(line: &str) -> bool {
                             drop(defaults);
                             match (inst, q, gain) {
                                 (Some(inst), Some(q), Some(gain)) => {
-                                    match spaph_audio::arm(pid, inst, gain, q) {
-                                        Ok(_) => {
-                                            let dev_name = spaph_audio::device_name(dev_idx).unwrap_or_else(|| "default".to_string());
-                                            manager().lock().unwrap().set_audio_device(pid, dev_name);
-                                            println!("audio connected for plugin {}", pid);
-                                            // track active audio plugin for volume default
-                                            // (audio engine tracks armed plugins; keep this for convenience)
-                                            // no-op: active_ids() is source of truth
-                                            let _ = pid;
+                                    if let Err(e) = spaph_audio::set_output_device(dev_idx) {
+                                        cmd_err!("error: {}", e);
+                                    } else {
+                                        match spaph_audio::arm(pid, inst, gain, q) {
+                                            Ok(_) => {
+                                                let dev_name = match dev_idx {
+                                                    Some(i) => spaph_audio::device_name(Some(i)).unwrap_or_else(|| format!("device {}", i)),
+                                                    None => "default".to_string(),
+                                                };
+                                                manager().lock().unwrap().set_audio_device(pid, dev_name.clone());
+                                                println!("audio connected for plugin {} on '{}'", pid, dev_name);
+                                            }
+                                            Err(e) => cmd_err!("error: {}", e),
                                         }
-                                        Err(e) => cmd_err!("error: {}", e),
                                     }
                                 }
                                 _ => cmd_err!("plugin {} not found", pid),
@@ -1053,6 +1091,22 @@ fn run_line(line: &str) -> bool {
 }
 
 
+/// Block until the main thread acknowledges the last command. Returns `false` if the
+/// session is ending (ack channel closed or stop requested), so the caller should exit.
+fn wait_for_ack(ack_rx: &std::sync::mpsc::Receiver<()>, stop: &std::sync::atomic::AtomicBool) -> bool {
+    loop {
+        match ack_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(()) => return true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return false;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 fn run_shell(osc_port: u16) {
     // Start OSC server
     let bind = format!("0.0.0.0:{}", osc_port);
@@ -1066,8 +1120,14 @@ fn run_shell(osc_port: u16) {
     *osc_thread_slot().lock().unwrap() = Some(handle);
     eprintln!("OSC listening on 0.0.0.0:{}", osc_port);
 
+    // Save terminal state before rustyline changes it, so we can restore on exit.
+    save_terminal();
+
     // Readline in a background thread so the main thread is free for the audio stream.
     let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    // Acknowledgements from the main thread: a new prompt is shown only after the previous
+    // command has finished, so command output never interleaves with the prompt.
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
     let stdin_stop_flag = stdin_stop();
     stdin_stop_flag.store(false, std::sync::atomic::Ordering::Relaxed);
     let handle = std::thread::spawn(move || {
@@ -1094,9 +1154,15 @@ fn run_shell(osc_port: u16) {
                     break;
                 }
                 Err(e) => {
-                    eprintln!("readline error: {}", e);
+                    if !stdin_stop().load(std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("readline error: {}", e);
+                    }
                     break;
                 }
+            }
+            // Wait for the command to finish before prompting again.
+            if !wait_for_ack(&ack_rx, &stdin_stop_flag) {
+                break;
             }
         }
         // Dropping rl here restores the terminal (rustyline's Drop).
@@ -1109,16 +1175,15 @@ fn run_shell(osc_port: u16) {
                 if !run_line(&line) {
                     break;
                 }
+                let _ = ack_tx.send(());
             }
             Err(_) => break,
         }
     }
+    // Disconnecting the ack channel wakes the reader thread so it exits without needing input.
+    drop(ack_tx);
     // Signal the stdin thread to stop and wait briefly for it to restore the terminal.
     stdin_stop().store(true, std::sync::atomic::Ordering::Relaxed);
-    close_stdin();
-    if let Some(h) = stdin_thread_slot().lock().unwrap().take() {
-        let _ = h.join();
-    }
     restore_terminal();
     cleanup_connections();
 }

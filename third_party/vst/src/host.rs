@@ -352,6 +352,15 @@ impl Editor for EditorInstance {
         }
     }
 
+    fn idle(&mut self) {
+        // Hosts must call effEditIdle regularly; GUI plugins (e.g. GTK-based ones) process
+        // their events and lay out their widgets from it. Without it the editor stays empty.
+        if self.is_open {
+            self.params
+                .dispatch(plugin::OpCode::EditorIdle, 0, 0, ptr::null_mut(), 0.0);
+        }
+    }
+
     fn close(&mut self) {
         self.params
             .dispatch(plugin::OpCode::EditorClose, 0, 0, ptr::null_mut(), 0.0);

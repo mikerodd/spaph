@@ -1851,6 +1851,8 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "vst",
+ "winapi",
+ "xcb",
 ]
 
 [[package]]
