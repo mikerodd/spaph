@@ -65,6 +65,7 @@ impl PluginFactory for Vst3Factory {
             info,
             plugin,
             presets_map,
+            sample_rate: 48000.0,
         }))
     }
 }
@@ -73,6 +74,7 @@ pub struct Vst3Instance {
     info: SpaphPluginInfo,
     plugin: std::sync::Arc<std::sync::Mutex<Vst3Plugin>>,
     presets_map: Vec<(i32, i32)>,
+    sample_rate: f64,
 }
 
 unsafe impl Send for Vst3Instance {}
@@ -81,7 +83,9 @@ impl SpaphPluginInstance for Vst3Instance {
     fn info(&self) -> &SpaphPluginInfo {
         &self.info
     }
-    fn set_sample_rate(&mut self, _sr: f64) {}
+    fn set_sample_rate(&mut self, sr: f64) {
+        self.sample_rate = sr;
+    }
     fn init(&mut self) {
         let _ = self.plugin.lock().unwrap().start_processing();
     }
@@ -92,8 +96,7 @@ impl SpaphPluginInstance for Vst3Instance {
         let _ = self.plugin.lock().unwrap().stop_processing();
     }
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], num_frames: usize) {
-        let sr = 44100.0;
-        let mut bufs = vst3_host::audio::AudioBuffers::new(inputs.len(), outputs.len(), num_frames, sr);
+        let mut bufs = vst3_host::audio::AudioBuffers::new(inputs.len(), outputs.len(), num_frames, self.sample_rate);
         for (i, ch) in inputs.iter().enumerate() {
             if i < bufs.inputs.len() {
                 for (j, s) in ch.iter().enumerate().take(num_frames) {

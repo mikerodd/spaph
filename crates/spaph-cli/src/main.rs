@@ -156,6 +156,7 @@ fn print_help() {
     println!("  midi disconnect               Stop all MIDI connections");
     println!("  midi disconnect <port> <id> [ch]  Disconnect one MIDI connection");
     println!("  audio list                    List audio output devices");
+    println!("  backend list                  List available audio backends");
     println!("  audio connect <id> [dev]      Connect plugin output to an audio device");
     println!("  audio disconnect [id] [dev]   Disconnect audio (one or all)");
     println!("  volume [<id>] <level>         Set host-side output gain (per plugin)");
@@ -458,6 +459,53 @@ fn disconnect_audio(plugin_id: Option<u32>, dev: Option<&str>) -> std::result::R
     }
 }
 
+static STDIN_STOP: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+static STDIN_THREAD: std::sync::OnceLock<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+    std::sync::OnceLock::new();
+
+fn stdin_stop() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    STDIN_STOP.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).clone()
+}
+fn stdin_thread_slot() -> &'static std::sync::Mutex<Option<std::thread::JoinHandle<()>>> {
+    STDIN_THREAD.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn close_stdin() {
+    #[cfg(unix)]
+    unsafe {
+        libc::close(0);
+    }
+    #[cfg(windows)]
+    unsafe {
+        use winapi::um::processenv::GetStdHandle;
+        use winapi::um::winbase::STD_INPUT_HANDLE;
+        use winapi::um::handleapi::CloseHandle;
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        CloseHandle(handle);
+    }
+}
+
+fn restore_terminal() {
+    #[cfg(unix)]
+    unsafe {
+        if libc::isatty(0) != 0 {
+            let _ = std::process::Command::new("stty").arg("sane").status();
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        use winapi::um::consoleapi::SetConsoleMode;
+        use winapi::um::processenv::GetStdHandle;
+        use winapi::um::winbase::STD_INPUT_HANDLE;
+        use winapi::um::wincon::ENABLE_ECHO_INPUT;
+        use winapi::um::wincon::ENABLE_LINE_INPUT;
+        use winapi::um::wincon::ENABLE_PROCESSED_INPUT;
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        SetConsoleMode(handle, ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+    }
+}
+
 fn cleanup_connections() {
     tracing::debug!("shutdown: stopping audio");
     disconnect_all_audio();
@@ -468,6 +516,12 @@ fn cleanup_connections() {
     if let Some(h) = osc_thread_slot().lock().unwrap().take() {
         let _ = h.join();
     }
+    stdin_stop().store(true, std::sync::atomic::Ordering::Relaxed);
+    close_stdin();
+    if let Some(h) = stdin_thread_slot().lock().unwrap().take() {
+        let _ = h.join();
+    }
+    restore_terminal();
 }
 
 /// Seconds allowed for the whole shutdown (stop audio/MIDI/OSC, then unload plugins).
@@ -1000,26 +1054,6 @@ fn run_line(line: &str) -> bool {
 
 
 fn run_shell(osc_port: u16) {
-    let mut rl = match DefaultEditor::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("readline init failed: {}", e);
-            let mut line = String::new();
-            loop {
-                print!("spaph> ");
-                use std::io::Write;
-                std::io::stdout().flush().ok();
-                line.clear();
-                if std::io::stdin().read_line(&mut line).is_err() {
-                    break;
-                }
-                if !run_line(line.trim()) {
-                    break;
-                }
-            }
-            return;
-        }
-    };
     // Start OSC server
     let bind = format!("0.0.0.0:{}", osc_port);
     let stop = osc_stop();
@@ -1032,22 +1066,64 @@ fn run_shell(osc_port: u16) {
     *osc_thread_slot().lock().unwrap() = Some(handle);
     eprintln!("OSC listening on 0.0.0.0:{}", osc_port);
 
-    loop {
-        match rl.readline("spaph> ") {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                if !run_line(line.trim()) {
+    // Readline in a background thread so the main thread is free for the audio stream.
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    let stdin_stop_flag = stdin_stop();
+    stdin_stop_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    let handle = std::thread::spawn(move || {
+        let mut rl = match DefaultEditor::new() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("readline init failed: {}", e);
+                return;
+            }
+        };
+        loop {
+            if stdin_stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            match rl.readline("spaph> ") {
+                Ok(line) => {
+                    let _ = rl.add_history_entry(line.as_str());
+                    if line_tx.send(line.trim().to_string()).is_err() {
+                        break;
+                    }
+                }
+                Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                    let _ = line_tx.send("quit".to_string());
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("readline error: {}", e);
                     break;
                 }
             }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
-            Err(e) => {
-                eprintln!("readline error: {}", e);
-                break;
+        }
+        // Dropping rl here restores the terminal (rustyline's Drop).
+    });
+    *stdin_thread_slot().lock().unwrap() = Some(handle);
+
+    loop {
+        match line_rx.recv() {
+            Ok(line) => {
+                if !run_line(&line) {
+                    break;
+                }
             }
+            Err(_) => break,
         }
     }
+    // Signal the stdin thread to stop and wait briefly for it to restore the terminal.
+    stdin_stop().store(true, std::sync::atomic::Ordering::Relaxed);
+    close_stdin();
+    if let Some(h) = stdin_thread_slot().lock().unwrap().take() {
+        let _ = h.join();
+    }
+    restore_terminal();
+    cleanup_connections();
 }
+
+
 
 static MANAGER: std::sync::OnceLock<std::sync::Mutex<PluginManager>> = std::sync::OnceLock::new();
 
@@ -1147,10 +1223,9 @@ fn main() {
     }
 
     // Eagerly create the audio stream so the node is always visible.
-    if let Err(e) = spaph_audio::start_stream(cfg.audio.sample_rate, cfg.audio.buffer_size, cfg.audio.device_index) {
+    if let Err(e) = spaph_audio::start_stream_with(cfg.audio.sample_rate, cfg.audio.buffer_size, cfg.audio.device_index) {
         eprintln!("audio stream error: {}", e);
     }
-
     run_shell(cfg.osc.port.unwrap_or(9000));
     shutdown(0);
 }

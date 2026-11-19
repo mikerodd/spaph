@@ -376,8 +376,6 @@ dependencies = [
 [[package]]
 name = "cpal"
 version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f02e8d0327b42d3e2e4ab2119af397344eb9fc54a34bf0ddeaa1277af8681f1"
 dependencies = [
  "alsa",
  "asio-sys",
@@ -404,6 +402,36 @@ dependencies = [
  "pipewire",
  "portable-atomic",
  "pulseaudio",
+ "web-sys",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "cpal"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f02e8d0327b42d3e2e4ab2119af397344eb9fc54a34bf0ddeaa1277af8681f1"
+dependencies = [
+ "alsa",
+ "block2",
+ "coreaudio-rs",
+ "dasp_sample",
+ "jni 0.22.4",
+ "js-sys",
+ "libc",
+ "mach2",
+ "ndk",
+ "ndk-context",
+ "num-derive",
+ "num-traits",
+ "objc2",
+ "objc2-audio-toolbox",
+ "objc2-avf-audio",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-foundation",
  "web-sys",
  "windows",
  "windows-core",
@@ -1718,7 +1746,7 @@ name = "spaph-audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cpal",
+ "cpal 0.18.2",
  "spaph-plugin",
  "spaph-types",
  "thiserror 2.0.21",
@@ -1731,6 +1759,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "rustyline",
  "serde",
  "serde_json",
@@ -1745,6 +1774,7 @@ dependencies = [
  "spaph-vst3",
  "tracing",
  "tracing-subscriber",
+ "winapi",
 ]
 
 [[package]]
@@ -2191,7 +2221,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e87482a285f626fb5f77e172c7d61727c83face514abd558be64f795fad0d7e7"
 dependencies = [
  "core-foundation",
- "cpal",
+ "cpal 0.18.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "crossbeam-queue",
  "libc",
  "libloading 0.8.9",
