@@ -29,6 +29,10 @@ cargo build --release --features spaph-audio/asio
 
 ## Run
 
+The audio stream starts at launch (silence when no plugin is connected), so the
+host appears as a node named `spaph` in PipeWire/Helvum immediately.
+
+
 ```sh
 ./target/release/spaph                 # uses ./spaph.json if present
 ./target/release/spaph --config rig.json
@@ -36,6 +40,12 @@ cargo build --release --features spaph-audio/asio
 
 Command-line options override the configuration file:
 `--config`, `--sample-rate`, `--buffer-size`, `--audio-device`, `--log-level`, `--osc-port`.
+
+## Audio backends
+
+`backend list` shows the backends available on the platform. On Linux the
+default is PulseAudio compatibility, which connects to PipeWire; with
+`--features spaph-audio/pipewire` the native PipeWire backend is used instead.
 
 ## Configuration file (`spaph.json`)
 

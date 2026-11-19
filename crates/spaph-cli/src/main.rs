@@ -20,7 +20,6 @@ struct AudioDefaults {
 
 static AUDIO_DEFAULTS: std::sync::OnceLock<std::sync::Mutex<AudioDefaults>> = std::sync::OnceLock::new();
 
-static ACTIVE_AUDIO_PLUGIN: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
 fn audio_defaults() -> &'static std::sync::Mutex<AudioDefaults> {
     AUDIO_DEFAULTS.get_or_init(|| std::sync::Mutex::new(AudioDefaults {
@@ -428,19 +427,18 @@ fn disconnect_midi_filtered(
 }
 
 fn disconnect_all_audio() {
-    *AUDIO_HANDLE.lock().unwrap() = None;
-    let active = *ACTIVE_AUDIO_PLUGIN.lock().unwrap();
-    if let Some(id) = active {
-        manager().lock().unwrap().clear_audio_device(id);
+    let armed = spaph_audio::active_ids();
+    spaph_audio::disarm_all();
+    for id in &armed {
+        manager().lock().unwrap().clear_audio_device(*id);
     }
-    *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = None;
 }
 
 fn disconnect_audio(plugin_id: Option<u32>, dev: Option<&str>) -> std::result::Result<(), String> {
-    let active = *ACTIVE_AUDIO_PLUGIN.lock().unwrap();
+    let armed = spaph_audio::active_ids();
     match plugin_id {
         Some(id) => {
-            if active != Some(id) {
+            if !armed.contains(&id) {
                 return Err(format!("plugin {} is not connected to audio", id));
             }
             if let Some(dev) = dev {
@@ -449,9 +447,8 @@ fn disconnect_audio(plugin_id: Option<u32>, dev: Option<&str>) -> std::result::R
                     return Err(format!("plugin {} is not connected to audio device '{}'", id, dev));
                 }
             }
-            *AUDIO_HANDLE.lock().unwrap() = None;
+            let _ = spaph_audio::disarm(id);
             manager().lock().unwrap().clear_audio_device(id);
-            *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = None;
             Ok(())
         }
         None => {
@@ -529,7 +526,7 @@ fn run_line(line: &str) -> bool {
                         let list = mgr.list();
                         // snapshot midi connections and audio armed status
                         let midi_info: Vec<(u32, Vec<(String, Option<u8>)>)> = list.iter().map(|p| (p.id, mgr.midi_connections(p.id))).collect();
-                        let audio_armed = *ACTIVE_AUDIO_PLUGIN.lock().unwrap();
+                        let audio_armed = spaph_audio::active_ids();
                         drop(mgr);
                         if list.is_empty() {
                             println!("(no plugins loaded)");
@@ -544,7 +541,7 @@ fn run_line(line: &str) -> bool {
                                         None => format!("{} (all)", port),
                                     }).collect::<Vec<_>>().join(", ")
                                 };
-                                let audio_str = if audio_armed == Some(p.id) {
+                                let audio_str = if audio_armed.contains(&p.id) {
                                     manager().lock().unwrap().audio_device_name(p.id).unwrap_or_else(|| "yes".to_string())
                                 } else {
                                     "no".to_string()
@@ -557,9 +554,9 @@ fn run_line(line: &str) -> bool {
                         if parts.len() < 3 {
                             cmd_err!("usage: plugin unload <plugin_id>");
                         } else if let Ok(id) = parts[2].parse::<u32>() {
-                            if *ACTIVE_AUDIO_PLUGIN.lock().unwrap() == Some(id) {
-                                *AUDIO_HANDLE.lock().unwrap() = None;
-                                *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = None;
+                            if spaph_audio::active_ids().contains(&id) {
+                                let _ = spaph_audio::disarm(id);
+                                manager().lock().unwrap().clear_audio_device(id);
                             }
                             let mut mgr = manager().lock().unwrap();
                             mgr.clear_audio_device(id);
@@ -904,13 +901,15 @@ fn run_line(line: &str) -> bool {
                             drop(defaults);
                             match (inst, q, gain) {
                                 (Some(inst), Some(q), Some(gain)) => {
-                                    match spaph_audio::start_audio(inst, q, dev_idx, None, None, gain) {
-                                        Ok(handle) => {
-                                            *AUDIO_HANDLE.lock().unwrap() = Some(handle);
+                                    match spaph_audio::arm(pid, inst, gain, q) {
+                                        Ok(_) => {
                                             let dev_name = spaph_audio::device_name(dev_idx).unwrap_or_else(|| "default".to_string());
                                             manager().lock().unwrap().set_audio_device(pid, dev_name);
-                                            println!("audio started for plugin {}", pid);
-                                            *ACTIVE_AUDIO_PLUGIN.lock().unwrap() = Some(pid);
+                                            println!("audio connected for plugin {}", pid);
+                                            // track active audio plugin for volume default
+                                            // (audio engine tracks armed plugins; keep this for convenience)
+                                            // no-op: active_ids() is source of truth
+                                            let _ = pid;
                                         }
                                         Err(e) => cmd_err!("error: {}", e),
                                     }
@@ -936,7 +935,7 @@ fn run_line(line: &str) -> bool {
         "volume" => {
             if parts.len() == 2 {
                 if let Ok(level) = parts[1].parse::<f32>() {
-                    let active = *ACTIVE_AUDIO_PLUGIN.lock().unwrap();
+                    let active = spaph_audio::active_ids().into_iter().next();
                     match active {
                         Some(pid) => {
                             let mgr = manager().lock().unwrap();
@@ -979,6 +978,17 @@ fn run_line(line: &str) -> bool {
         "disconnect" => {
             cleanup_connections();
             println!("disconnected");
+        }
+        "backend" => {
+            if parts.len() >= 2 && parts[1] == "list" {
+                for (name, avail, current) in spaph_audio::backend_list() {
+                    let mark = if current { " (current)" } else { "" };
+                    let status = if avail { "available" } else { "unavailable" };
+                    println!("  {}  {}{}", name, status, mark);
+                }
+            } else {
+                cmd_err!("usage: backend list");
+            }
         }
         "quit" | "exit" => {
             return false;
@@ -1045,7 +1055,6 @@ fn manager() -> &'static std::sync::Mutex<PluginManager> {
     MANAGER.get_or_init(|| std::sync::Mutex::new(PluginManager::new()))
 }
 
-static AUDIO_HANDLE: std::sync::Mutex<Option<spaph_audio::AudioHandle>> = std::sync::Mutex::new(None);
 
 /// Load the configuration: `--config` if given (must exist), else `./spaph.json` if present.
 fn load_startup_config(cli: &Cli) -> (Option<PathBuf>, Config) {
@@ -1135,6 +1144,11 @@ fn main() {
             eprintln!("error: {}", msg);
             shutdown(1);
         }
+    }
+
+    // Eagerly create the audio stream so the node is always visible.
+    if let Err(e) = spaph_audio::start_stream(cfg.audio.sample_rate, cfg.audio.buffer_size, cfg.audio.device_index) {
+        eprintln!("audio stream error: {}", e);
     }
 
     run_shell(cfg.osc.port.unwrap_or(9000));
