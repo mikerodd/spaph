@@ -942,6 +942,9 @@ fn run_line(line: &str) -> bool {
                             println!("  delivered {:>10}  handed to plugins", s.delivered);
                             println!("  deferred  {:>10}  audio blocks skipped, plugin busy (events kept)", s.deferred);
                             println!("  pending   {:>10}  queued but not yet delivered", s.queued.saturating_sub(s.delivered));
+                            println!("  note-on   {:>10}  delivered", s.note_on);
+                            println!("  note-off  {:>10}  delivered", s.note_off);
+                            println!("  held      {:>10}  note-on minus note-off (0 when all keys are released)", s.note_on as i64 - s.note_off as i64);
                         }
                     }
                     "disconnect" => {

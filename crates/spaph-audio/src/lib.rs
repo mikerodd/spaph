@@ -107,6 +107,8 @@ pub mod midi_stats {
     static QUEUED: AtomicU64 = AtomicU64::new(0);
     static DELIVERED: AtomicU64 = AtomicU64::new(0);
     static DEFERRED: AtomicU64 = AtomicU64::new(0);
+    static NOTE_ON: AtomicU64 = AtomicU64::new(0);
+    static NOTE_OFF: AtomicU64 = AtomicU64::new(0);
 
     /// A MIDI message arrived from an input port (before channel filtering).
     pub fn on_received() { RECEIVED.fetch_add(1, Relaxed); }
@@ -114,8 +116,20 @@ pub mod midi_stats {
     pub fn on_filtered() { FILTERED.fetch_add(1, Relaxed); }
     /// A message was placed in a plugin's queue.
     pub fn on_queued() { QUEUED.fetch_add(1, Relaxed); }
-    /// Messages were handed to a plugin during an audio block.
-    pub fn on_delivered(n: usize) { DELIVERED.fetch_add(n as u64, Relaxed); }
+    /// Messages were handed to a plugin during an audio block; note-on and note-off are
+    /// counted separately so a stuck note shows up as more note-ons than note-offs.
+    pub fn on_delivered(events: &[super::MidiEvent]) {
+        DELIVERED.fetch_add(events.len() as u64, Relaxed);
+        for ev in events {
+            let status = ev.data.first().copied().unwrap_or(0);
+            let velocity = ev.data.get(2).copied().unwrap_or(0);
+            match status & 0xF0 {
+                0x90 if velocity > 0 => { NOTE_ON.fetch_add(1, Relaxed); }
+                0x90 | 0x80 => { NOTE_OFF.fetch_add(1, Relaxed); }
+                _ => {}
+            }
+        }
+    }
     /// An audio block found a plugin busy; its queued events were kept for the next block.
     pub fn on_deferred() { DEFERRED.fetch_add(1, Relaxed); }
 
@@ -126,6 +140,8 @@ pub mod midi_stats {
         pub queued: u64,
         pub delivered: u64,
         pub deferred: u64,
+        pub note_on: u64,
+        pub note_off: u64,
     }
 
     pub fn snapshot() -> Snapshot {
@@ -135,11 +151,13 @@ pub mod midi_stats {
             queued: QUEUED.load(Relaxed),
             delivered: DELIVERED.load(Relaxed),
             deferred: DEFERRED.load(Relaxed),
+            note_on: NOTE_ON.load(Relaxed),
+            note_off: NOTE_OFF.load(Relaxed),
         }
     }
 
     pub fn reset() {
-        for c in [&RECEIVED, &FILTERED, &QUEUED, &DELIVERED, &DEFERRED] {
+        for c in [&RECEIVED, &FILTERED, &QUEUED, &DELIVERED, &DEFERRED, &NOTE_ON, &NOTE_OFF] {
             c.store(0, Relaxed);
         }
     }
@@ -211,7 +229,7 @@ pub fn start_stream() -> Result<()> {
                 .try_lock()
                 .map(|mut q| std::mem::take(&mut *q))
                 .unwrap_or_default();
-            midi_stats::on_delivered(events.len());
+            midi_stats::on_delivered(&events);
             for ev in &events {
                 inst.handle_midi(ev);
             }
@@ -426,12 +444,19 @@ mod tests {
         midi_stats::on_received();
         midi_stats::on_filtered();
         midi_stats::on_queued();
-        midi_stats::on_delivered(3);
+        let ev = |data: &[u8]| MidiEvent { timestamp: 0, data: data.to_vec() };
+        midi_stats::on_delivered(&[
+            ev(&[0x90, 60, 100]), // note on
+            ev(&[0x90, 60, 0]),   // note on with velocity 0 is a note off
+            ev(&[0x81, 62, 40]),  // note off, channel 2
+        ]);
         midi_stats::on_deferred();
         let s = midi_stats::snapshot();
         assert_eq!(
             s,
-            midi_stats::Snapshot { received: 2, filtered: 1, queued: 1, delivered: 3, deferred: 1 }
+            midi_stats::Snapshot {
+                received: 2, filtered: 1, queued: 1, delivered: 3, deferred: 1, note_on: 1, note_off: 2,
+            }
         );
         midi_stats::reset();
         assert_eq!(midi_stats::snapshot().received, 0);
