@@ -60,6 +60,10 @@ struct Cli {
     #[arg(long)]
     audio_device: Option<usize>,
 
+    /// Audio backend override (e.g. wasapi, asio, alsa, jack)
+    #[arg(long)]
+    audio_backend: Option<String>,
+
     /// Log level override
     #[arg(long, value_enum)]
     log_level: Option<LogLevel>,
@@ -154,6 +158,7 @@ fn print_help() {
     println!("  midi listen <port> [ch]       Capture MIDI input, optional channel filter 1..=16");
     println!("  midi connect <port> <id> [ch] Connect a MIDI input to a plugin, optional channel filter");
     println!("  midi disconnect               Stop all MIDI connections");
+    println!("  midi stats [reset]            Show or reset MIDI event counters");
     println!("  midi disconnect <port> <id> [ch]  Disconnect one MIDI connection");
     println!("  audio list                    List audio output devices");
     println!("  backend list                  List available audio backends");
@@ -301,9 +306,13 @@ fn midi_connect(port: String, plugin_id: u32, channel: Option<u8>) {
             }
             match listener.rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(ev) => {
+                    spaph_audio::midi_stats::on_received();
                     if midi_matches(&ev.data, channel) {
+                        spaph_audio::midi_stats::on_queued();
                         let mut q = q.lock().unwrap();
                         q.push(ev);
+                    } else {
+                        spaph_audio::midi_stats::on_filtered();
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -862,7 +871,7 @@ fn run_line(line: &str) -> bool {
         }
         "midi" => {
             if parts.len() < 2 {
-                cmd_err!("usage: midi <list|listen|connect|disconnect> ...");
+                cmd_err!("usage: midi <list|listen|connect|disconnect|stats> ...");
             } else {
                 match parts[1].as_str() {
                     "list" => match spaph_midi::list_input_ports() {
@@ -918,6 +927,21 @@ fn run_line(line: &str) -> bool {
                             }
                         } else {
                             cmd_err!("invalid plugin id");
+                        }
+                    }
+                    "stats" => {
+                        if parts.len() >= 3 && parts[2] == "reset" {
+                            spaph_audio::midi_stats::reset();
+                            println!("midi stats reset");
+                        } else {
+                            let s = spaph_audio::midi_stats::snapshot();
+                            println!("midi events (all connections, since start or last reset):");
+                            println!("  received  {:>10}  from input ports", s.received);
+                            println!("  filtered  {:>10}  rejected by channel filter", s.filtered);
+                            println!("  queued    {:>10}  waiting for a plugin", s.queued);
+                            println!("  delivered {:>10}  handed to plugins", s.delivered);
+                            println!("  deferred  {:>10}  audio blocks skipped, plugin busy (events kept)", s.deferred);
+                            println!("  pending   {:>10}  queued but not yet delivered", s.queued.saturating_sub(s.delivered));
                         }
                     }
                     "disconnect" => {
@@ -1259,6 +1283,7 @@ fn main() {
         sample_rate: cli.sample_rate,
         buffer_size: cli.buffer_size,
         device_index: cli.audio_device,
+        backend: cli.audio_backend.clone(),
         log_level: cli.log_level.map(|l| l.name().to_string()),
         osc_port: cli.osc_port,
     };
@@ -1269,6 +1294,10 @@ fn main() {
 
     init_logging(cfg.log_level.as_deref().unwrap_or("none"));
     tracing::debug!("config loaded: {:?}", config_path);
+    if let Err(e) = spaph_audio::set_backend(cfg.audio.backend.as_deref()) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
     {
         let mut d = audio_defaults().lock().unwrap();
         d.sample_rate = cfg.audio.sample_rate;

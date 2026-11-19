@@ -320,7 +320,8 @@ pub fn host_dispatch(
 
         // ...
         Ok(OpCode::CanDo) => {
-            info!("Plugin is asking if host can: {}.", read_string(ptr));
+            // Plugins probe many host capabilities at load time; this is diagnostic only.
+            debug!("Plugin is asking if host can: {}.", read_string(ptr));
         }
 
         Ok(OpCode::GetVendorVersion) => return host.get_info().0,

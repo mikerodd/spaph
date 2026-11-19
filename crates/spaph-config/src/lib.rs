@@ -29,6 +29,8 @@ pub struct AudioSettings {
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
     pub device_index: Option<usize>,
+    /// Audio host backend, e.g. "wasapi" or "asio" (case-insensitive). `None` = system default.
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -54,6 +56,7 @@ pub struct Overrides {
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
     pub device_index: Option<usize>,
+    pub backend: Option<String>,
     pub log_level: Option<String>,
     pub osc_port: Option<u16>,
 }
@@ -119,6 +122,9 @@ pub fn apply_overrides(cfg: &mut Config, o: &Overrides) -> Result<(), ConfigErro
     }
     if let Some(v) = o.device_index {
         cfg.audio.device_index = Some(v);
+    }
+    if let Some(v) = &o.backend {
+        cfg.audio.backend = Some(v.clone());
     }
     if let Some(v) = o.osc_port {
         cfg.osc.port = Some(v);
@@ -236,6 +242,26 @@ mod tests {
     fn missing_file_error_names_the_path() {
         let err = load_config(Path::new("/definitely/not/here/spaph.json")).unwrap_err();
         assert!(err.to_string().contains("/definitely/not/here/spaph.json"), "{err}");
+    }
+
+    #[test]
+    fn audio_backend_is_read_from_file() {
+        let cfg = parse_config(r#"{ "audio": { "backend": "asio" } }"#, &origin()).unwrap();
+        assert_eq!(cfg.audio.backend.as_deref(), Some("asio"));
+    }
+
+    #[test]
+    fn audio_backend_cli_overrides_file() {
+        let mut cfg = parse_config(r#"{ "audio": { "backend": "wasapi" } }"#, &origin()).unwrap();
+        let o = Overrides { backend: Some("asio".into()), ..Default::default() };
+        apply_overrides(&mut cfg, &o).unwrap();
+        assert_eq!(cfg.audio.backend.as_deref(), Some("asio"));
+    }
+
+    #[test]
+    fn audio_backend_unset_stays_none() {
+        let cfg = parse_config("{}", &origin()).unwrap();
+        assert_eq!(cfg.audio.backend, None);
     }
 
     #[test]

@@ -96,6 +96,56 @@ pub fn disarm_all() {
 }
 
 // ---------------------------------------------------------------------------
+// MIDI event counters (diagnostics for lost or delayed events)
+// ---------------------------------------------------------------------------
+
+pub mod midi_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static RECEIVED: AtomicU64 = AtomicU64::new(0);
+    static FILTERED: AtomicU64 = AtomicU64::new(0);
+    static QUEUED: AtomicU64 = AtomicU64::new(0);
+    static DELIVERED: AtomicU64 = AtomicU64::new(0);
+    static DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+    /// A MIDI message arrived from an input port (before channel filtering).
+    pub fn on_received() { RECEIVED.fetch_add(1, Relaxed); }
+    /// A message was rejected by the channel filter.
+    pub fn on_filtered() { FILTERED.fetch_add(1, Relaxed); }
+    /// A message was placed in a plugin's queue.
+    pub fn on_queued() { QUEUED.fetch_add(1, Relaxed); }
+    /// Messages were handed to a plugin during an audio block.
+    pub fn on_delivered(n: usize) { DELIVERED.fetch_add(n as u64, Relaxed); }
+    /// An audio block found a plugin busy; its queued events were kept for the next block.
+    pub fn on_deferred() { DEFERRED.fetch_add(1, Relaxed); }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Snapshot {
+        pub received: u64,
+        pub filtered: u64,
+        pub queued: u64,
+        pub delivered: u64,
+        pub deferred: u64,
+    }
+
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            received: RECEIVED.load(Relaxed),
+            filtered: FILTERED.load(Relaxed),
+            queued: QUEUED.load(Relaxed),
+            delivered: DELIVERED.load(Relaxed),
+            deferred: DEFERRED.load(Relaxed),
+        }
+    }
+
+    pub fn reset() {
+        for c in [&RECEIVED, &FILTERED, &QUEUED, &DELIVERED, &DEFERRED] {
+            c.store(0, Relaxed);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Output stream (process-wide, so any thread such as the OSC server can restart it)
 // ---------------------------------------------------------------------------
 
@@ -114,7 +164,7 @@ pub fn start_stream() -> Result<()> {
         return Ok(());
     }
     ensure_pulse_prop();
-    let host = cpal::default_host();
+    let host = current_host()?;
     let device_index = get_device_index();
     let device = match device_index {
         Some(i) => host.output_devices().map_err(|e| SpaphError::Audio(e.to_string()))?.nth(i)
@@ -140,19 +190,28 @@ pub fn start_stream() -> Result<()> {
         };
         let master = get_master_gain();
         for plugin in active.iter() {
-            let po = {
-                let p = plugin.instance.lock().unwrap_or_else(|e| e.into_inner());
-                let n = p.info().num_outputs as usize;
-                if n == 0 { 1 } else { n }
-            };
-            let events: Vec<MidiEvent> = {
-                let mut q = plugin.midi_queue.lock().unwrap_or_else(|e| e.into_inner());
-                std::mem::take(&mut *q)
-            };
+            // Lock the instance first. If another thread holds it, leave the queued MIDI
+            // events where they are and try again on the next block; taking them first would
+            // throw them away (lost note-offs).
             let mut inst = match plugin.instance.try_lock() {
                 Ok(g) => g,
-                Err(_) => continue,
+                Err(_) => {
+                    midi_stats::on_deferred();
+                    continue;
+                }
             };
+            let po = {
+                let n = inst.info().num_outputs as usize;
+                if n == 0 { 1 } else { n }
+            };
+            // Never block the audio thread on the queue: if the MIDI thread is pushing right
+            // now, play this block without new events and deliver them on the next one.
+            let events: Vec<MidiEvent> = plugin
+                .midi_queue
+                .try_lock()
+                .map(|mut q| std::mem::take(&mut *q))
+                .unwrap_or_default();
+            midi_stats::on_delivered(events.len());
             for ev in &events {
                 inst.handle_midi(ev);
             }
@@ -161,7 +220,7 @@ pub fn start_stream() -> Result<()> {
             let inputs: &[&[f32]] = &[];
             inst.process(inputs, &mut out_refs, frames);
             drop(inst);
-            let gain = *plugin.gain.lock().unwrap_or_else(|e| e.into_inner());
+            let gain = plugin.gain.try_lock().map(|g| *g).unwrap_or(1.0);
             for f in 0..frames {
                 for c in 0..channels_c {
                     let src_ch = if po > 0 { c % po } else { 0 };
@@ -251,7 +310,7 @@ pub fn start_stream_with(sample_rate: Option<u32>, buffer_size: Option<u32>, dev
 
 pub fn list_devices() -> Result<Vec<String>> {
     ensure_pulse_prop();
-    let host = cpal::default_host();
+    let host = current_host()?;
     // Keep every device (even unnamed ones) so positions match the indices used by start_stream.
     let mut out = Vec::new();
     if let Ok(devs) = host.output_devices() {
@@ -274,21 +333,107 @@ pub fn device_name(index: Option<usize>) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Audio backend (host) selection
+// ---------------------------------------------------------------------------
+
+/// Backend chosen with `audio.backend` / `--audio-backend`. `None` = cpal's default host.
+static BACKEND: Mutex<Option<cpal::HostId>> = Mutex::new(None);
+
+/// Select the audio backend by name (case-insensitive), or `None` for the default.
+/// Must be called before the stream starts; the name must be one cpal compiled in.
+pub fn set_backend(name: Option<&str>) -> Result<()> {
+    let id = match name {
+        None => None,
+        Some(wanted) => Some(
+            cpal::available_hosts()
+                .into_iter()
+                .find(|id| id.name().eq_ignore_ascii_case(wanted))
+                .ok_or_else(|| {
+                    let names: Vec<&str> = cpal::available_hosts().iter().map(|id| id.name()).collect();
+                    SpaphError::Audio(format!(
+                        "unknown audio backend '{}' (compiled in: {})",
+                        wanted,
+                        names.join(", ")
+                    ))
+                })?,
+        ),
+    };
+    *BACKEND.lock().unwrap() = id;
+    Ok(())
+}
+
+/// Host used for devices and streams: the selected backend, else cpal's default.
+fn current_host() -> Result<cpal::Host> {
+    match *BACKEND.lock().unwrap() {
+        Some(id) => cpal::host_from_id(id).map_err(|e| SpaphError::Audio(e.to_string())),
+        None => Ok(cpal::default_host()),
+    }
+}
+
+/// `(name, available, in_use)` for every backend compiled in.
+/// A backend is available only if it can be opened and has at least one output device, so
+/// ASIO without an installed driver is reported as unavailable.
 pub fn backend_list() -> Vec<(String, bool, bool)> {
     ensure_pulse_prop();
-    let current = cpal::default_host().id();
+    let in_use = match *BACKEND.lock().unwrap() {
+        Some(id) => id,
+        None => cpal::default_host().id(),
+    };
     let mut out = Vec::new();
     for id in cpal::available_hosts() {
         let available = if id.name().eq_ignore_ascii_case("jack") {
             true
         } else {
-            cpal::host_from_id(id).is_ok()
+            cpal::host_from_id(id)
+                .ok()
+                .and_then(|host| host.output_devices().ok())
+                .map(|mut devs| devs.next().is_some())
+                .unwrap_or(false)
         };
-        out.push((id.name().to_string(), available, id == current));
+        out.push((id.name().to_string(), available, id == in_use));
     }
     out
 }
 
 pub fn _err(msg: &str) -> SpaphError {
     SpaphError::Audio(msg.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_backend_is_rejected_with_available_list() {
+        let err = set_backend(Some("no-such-backend")).unwrap_err().to_string();
+        assert!(err.contains("unknown audio backend 'no-such-backend'"), "{err}");
+        assert!(err.contains("compiled in:"), "{err}");
+    }
+
+    #[test]
+    fn backend_list_marks_exactly_one_in_use() {
+        let list = backend_list();
+        assert!(!list.is_empty());
+        assert!(list.iter().filter(|(_, _, in_use)| *in_use).count() <= 1);
+    }
+
+    #[test]
+    fn midi_stats_count_and_reset() {
+        // Counters are process-wide; this is the only test that touches them.
+        midi_stats::reset();
+        midi_stats::on_received();
+        midi_stats::on_received();
+        midi_stats::on_filtered();
+        midi_stats::on_queued();
+        midi_stats::on_delivered(3);
+        midi_stats::on_deferred();
+        let s = midi_stats::snapshot();
+        assert_eq!(
+            s,
+            midi_stats::Snapshot { received: 2, filtered: 1, queued: 1, delivered: 3, deferred: 1 }
+        );
+        midi_stats::reset();
+        assert_eq!(midi_stats::snapshot().received, 0);
+    }
 }

@@ -39,7 +39,7 @@ host appears as a node named `spaph` in PipeWire/Helvum immediately.
 ```
 
 Command-line options override the configuration file:
-`--config`, `--sample-rate`, `--buffer-size`, `--audio-device`, `--log-level`, `--osc-port`.
+`--config`, `--sample-rate`, `--buffer-size`, `--audio-device`, `--audio-backend`, `--log-level`, `--osc-port`.
 
 ## Audio backends
 
@@ -47,13 +47,17 @@ Command-line options override the configuration file:
 default is PulseAudio compatibility, which connects to PipeWire; with
 `--features spaph-audio/pipewire` the native PipeWire backend is used instead.
 
+On Windows the default is WASAPI. Set `audio.backend` (or `--audio-backend asio`)
+to use ASIO; it is reported as available only when a driver such as ASIO4ALL is
+installed. The name must match a backend listed by `backend list`.
+
 ## Configuration file (`spaph.json`)
 
 Every field is optional; unset fields use built-in defaults.
 
 ```json
 {
-  "audio": { "sample_rate": 48000, "buffer_size": 256, "device_index": 0 },
+  "audio": { "sample_rate": 48000, "buffer_size": 256, "device_index": 0, "backend": "wasapi" },
   "osc": { "port": 9000 },
   "log_level": "info",
   "script": "startup.spaph"

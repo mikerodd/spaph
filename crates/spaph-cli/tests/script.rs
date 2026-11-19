@@ -236,3 +236,20 @@ fn plugin_preset_save_unknown_id_reports_error_without_panic() {
     assert!(!dir.join("out.fxp").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn unknown_audio_backend_in_config_exits_with_message() {
+    let dir = scratch("badbackend");
+    std::fs::write(dir.join("c.json"), r#"{ "audio": { "backend": "no-such-backend" } }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic: {err}");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(err.contains("unknown audio backend 'no-such-backend'"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
