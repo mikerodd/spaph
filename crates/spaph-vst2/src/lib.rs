@@ -163,10 +163,14 @@ impl SpaphPluginInstance for Vst2Instance {
         if midi_events.is_empty() {
             return;
         }
+        for ev in events {
+            tracing::debug!("vst2 midi -> effProcessEvents: {:02x?}", ev.data);
+        }
         let n = midi_events.len();
         let size = std::mem::size_of::<vst::api::Events>()
             + (n.saturating_sub(2)) * std::mem::size_of::<*mut vst::api::Event>();
-        let mut buf = vec![0u8; size];
+        // Back the block with u64 words so it is 8-byte aligned, as `Events` requires.
+        let mut buf = vec![0u64; size.div_ceil(8)];
         let events_ptr = buf.as_mut_ptr() as *mut vst::api::Events;
         let mut boxes: Vec<Box<vst::api::MidiEvent>> =
             midi_events.into_iter().map(Box::new).collect();
