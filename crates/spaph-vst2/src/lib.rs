@@ -2,7 +2,7 @@
 
 #![allow(deprecated)]
 
-use spaph_plugin::{ParamInfo, PluginFactory, PluginInfo as SpaphPluginInfo, PluginInstance as SpaphPluginInstance};
+use spaph_plugin::{EditorJob, ParamInfo, PluginFactory, PluginInfo as SpaphPluginInfo, PluginInstance as SpaphPluginInstance};
 use spaph_types::{MidiEvent, PluginFormat, Result, SpaphError};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,7 @@ impl PluginFactory for Vst2Factory {
         // reports an empty editor rect. get_editor() can only be called once per instance,
         // so keep the editor for the lifetime of the plugin.
         let editor = inst.get_editor().filter(|e| e.size() != (0, 0));
+        let has_gui = editor.is_some();
         let vst_info: VstInfo = inst.get_info();
         let params = inst.get_parameter_object();
         let num = vst_info.parameters.max(0) as u32;
@@ -81,11 +82,47 @@ impl PluginFactory for Vst2Factory {
             params,
             fx_id: vst_info.unique_id,
             fx_version: vst_info.version,
+            has_gui,
             // Declared before `_instance` so the editor is dropped first.
-            editor,
+            editor_slot: Arc::new(Mutex::new(editor.map(SendEditor))),
             _instance: inst,
             sample_rate: 48000.0,
         }))
+    }
+}
+
+/// The plugin's `Editor` object. It only talks to the plugin through the parameter object and
+/// is moved between the instance and one editor thread at a time, never used concurrently.
+struct SendEditor(Box<dyn Editor>);
+
+// SAFETY: see the type comment; ownership is handed over, never shared.
+unsafe impl Send for SendEditor {}
+
+/// An editor window that runs on its own thread and gives the editor back when it closes.
+struct Vst2EditorJob {
+    editor: Option<SendEditor>,
+    slot: Arc<Mutex<Option<SendEditor>>>,
+    title: String,
+}
+
+impl EditorJob for Vst2EditorJob {
+    fn run(mut self: Box<Self>, stop: &std::sync::atomic::AtomicBool) -> spaph_types::Result<()> {
+        let mut editor = self.editor.take().expect("editor job runs once");
+        let (width, height) = editor.0.size();
+        let result = editor::open_window(&self.title, width, height)
+            .and_then(|mut window| editor::run_editor(editor.0.as_mut(), window.as_mut(), stop));
+        // The window is gone by now; the editor can be opened again later.
+        *self.slot.lock().unwrap() = Some(editor);
+        result
+    }
+}
+
+impl Drop for Vst2EditorJob {
+    fn drop(&mut self) {
+        // A job that never ran must not lose the editor.
+        if let Some(editor) = self.editor.take() {
+            *self.slot.lock().unwrap() = Some(editor);
+        }
     }
 }
 
@@ -94,7 +131,9 @@ pub struct Vst2Instance {
     params: Arc<dyn PluginParameters>,
     fx_id: i32,
     fx_version: i32,
-    editor: Option<Box<dyn Editor>>,
+    has_gui: bool,
+    /// The editor while no window is open; taken by `editor_job` and returned on close.
+    editor_slot: Arc<Mutex<Option<SendEditor>>>,
     _instance: vst::host::PluginInstance,
     sample_rate: f64,
 }
@@ -207,17 +246,24 @@ impl SpaphPluginInstance for Vst2Instance {
     }
 
     fn has_editor(&self) -> bool {
-        self.editor.is_some()
+        self.has_gui
     }
 
-    fn open_editor(&mut self) -> Result<()> {
+    fn editor_job(&mut self) -> Result<Box<dyn EditorJob>> {
+        if !self.has_gui {
+            return Err(SpaphError::Plugin("plugin has no editor".into()));
+        }
         let editor = self
-            .editor
-            .as_mut()
-            .ok_or_else(|| SpaphError::Plugin("plugin has no editor".into()))?;
-        let (width, height) = editor.size();
-        let mut window = editor::open_window(&self.info.name, width, height)?;
-        editor::run_editor(editor.as_mut(), window.as_mut())
+            .editor_slot
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| SpaphError::Plugin("editor is already open".into()))?;
+        Ok(Box::new(Vst2EditorJob {
+            editor: Some(editor),
+            slot: self.editor_slot.clone(),
+            title: self.info.name.clone(),
+        }))
     }
 
     fn save_preset_file(&self, path: &std::path::Path) -> Result<()> {

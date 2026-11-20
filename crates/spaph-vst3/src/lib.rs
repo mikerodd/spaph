@@ -1,6 +1,6 @@
 //! VST3 host support for spaph, built on the `vst3-host` crate.
 
-use spaph_plugin::{ParamInfo, PluginFactory, PluginInfo as SpaphPluginInfo, PluginInstance as SpaphPluginInstance};
+use spaph_plugin::{EditorJob, ParamInfo, PluginFactory, PluginInfo as SpaphPluginInfo, PluginInstance as SpaphPluginInstance};
 use spaph_types::{MidiEvent, PluginFormat, Result, SpaphError};
 use std::path::Path;
 use vst3_host::plugin::Plugin as Vst3Plugin;
@@ -79,6 +79,49 @@ pub struct Vst3Instance {
 
 unsafe impl Send for Vst3Instance {}
 
+/// The plugin shared with the audio path. The editor thread only takes this lock briefly
+/// to run the plugin's GUI loop, and never holds the spaph instance lock.
+struct SharedPlugin(std::sync::Arc<std::sync::Mutex<Vst3Plugin>>);
+
+// SAFETY: the plugin is only accessed through its mutex, as the instance already is.
+unsafe impl Send for SharedPlugin {}
+
+/// A VST3 editor window that runs on its own thread.
+struct Vst3EditorJob {
+    plugin: SharedPlugin,
+}
+
+impl EditorJob for Vst3EditorJob {
+    fn run(self: Box<Self>, stop: &std::sync::atomic::AtomicBool) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        use vst3_host::window::PluginWindow;
+        let plugin = self.plugin.0;
+        let mut window = PluginWindow::new(plugin.clone());
+        window.open().map_err(|e| SpaphError::Plugin(e.to_string()))?;
+        while !stop.load(Ordering::Relaxed) && !window.closed_by_user() {
+            let _ = window.service_platform_events();
+            if let Ok(mut p) = plugin.lock() {
+                p.service_run_loop();
+            }
+            // Pump the Windows message queue so the plugin's editor (and any child
+            // windows such as login dialogs) can receive input and paint.
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use winapi::um::winuser::{PeekMessageW, TranslateMessage, DispatchMessageW, PM_REMOVE};
+                use winapi::um::winuser::MSG;
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        window.close();
+        Ok(())
+    }
+}
+
 impl SpaphPluginInstance for Vst3Instance {
     fn info(&self) -> &SpaphPluginInfo {
         &self.info
@@ -142,31 +185,8 @@ impl SpaphPluginInstance for Vst3Instance {
         self.plugin.lock().unwrap().has_editor()
     }
 
-    fn open_editor(&mut self) -> Result<()> {
-        use vst3_host::window::PluginWindow;
-        let mut window = PluginWindow::new(self.plugin.clone());
-        window.open().map_err(|e| SpaphError::Plugin(e.to_string()))?;
-        while !window.closed_by_user() {
-            let _ = window.service_platform_events();
-            if let Ok(mut p) = self.plugin.lock() {
-                p.service_run_loop();
-            }
-            // Pump the Windows message queue so the plugin's editor (and any child
-            // windows such as login dialogs) can receive input and paint.
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use winapi::um::winuser::{PeekMessageW, TranslateMessage, DispatchMessageW, PM_REMOVE};
-                use winapi::um::winuser::MSG;
-                let mut msg: MSG = std::mem::zeroed();
-                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(16));
-        }
-        window.close();
-        Ok(())
+    fn editor_job(&mut self) -> Result<Box<dyn EditorJob>> {
+        Ok(Box::new(Vst3EditorJob { plugin: SharedPlugin(self.plugin.clone()) }))
     }
 
     fn save_preset_file(&self, path: &Path) -> Result<()> {

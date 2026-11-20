@@ -145,7 +145,8 @@ fn print_help() {
     println!("  plugin load <path>            Load a plugin and display its interface");
     println!("  plugin list                   List loaded plugins");
     println!("  plugin unload <id>            Unload a plugin by id");
-    println!("  plugin show <id>              Show plugin editor UI (VST2 and VST3)");
+    println!("  plugin show <id>              Open plugin editor window (VST2 and VST3); prompt stays usable");
+    println!("  plugin hide <id>              Close plugin editor window");
     println!("  plugin preset list <id>       List presets of a plugin");
     println!("  plugin preset select <id> <n> Select a preset (1-based)");
     println!("  plugin preset scan <dir>      Scan a directory for preset files");
@@ -547,7 +548,81 @@ fn restore_terminal() {
     }
 }
 
+/// A plugin editor window running on its own thread.
+struct EditorThread {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+static EDITORS: std::sync::OnceLock<Mutex<std::collections::HashMap<u32, EditorThread>>> =
+    std::sync::OnceLock::new();
+
+fn editors() -> &'static Mutex<std::collections::HashMap<u32, EditorThread>> {
+    EDITORS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Open the editor of plugin `pid` on its own thread and return at once, so the prompt,
+/// MIDI and audio keep running. The window is closed with `plugin hide` or by the user.
+fn open_editor_window(pid: u32) -> std::result::Result<(), String> {
+    {
+        let mut map = editors().lock().unwrap();
+        // Forget windows the user already closed.
+        let finished: Vec<u32> = map.iter().filter(|(_, e)| e.handle.is_finished()).map(|(id, _)| *id).collect();
+        for id in finished {
+            if let Some(e) = map.remove(&id) {
+                let _ = e.handle.join();
+            }
+        }
+        if map.contains_key(&pid) {
+            return Err(format!("editor for plugin {} is already open", pid));
+        }
+    }
+    let inst = manager()
+        .lock()
+        .unwrap()
+        .get_instance(pid)
+        .ok_or_else(|| format!("plugin {} not found", pid))?;
+    // Hold the instance lock only to take the editor, not while the window is open.
+    let job = inst.lock().unwrap().editor_job().map_err(|e| e.to_string())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let handle = std::thread::spawn(move || {
+        if let Err(e) = job.run(&thread_stop) {
+            eprintln!("editor for plugin {}: {}", pid, e);
+        }
+    });
+    editors().lock().unwrap().insert(pid, EditorThread { stop, handle });
+    Ok(())
+}
+
+/// Close the editor window of plugin `pid` and wait until it is gone. Returns `false` if no
+/// window was open.
+fn close_editor_window(pid: u32) -> bool {
+    let entry = editors().lock().unwrap().remove(&pid);
+    match entry {
+        Some(e) => {
+            e.stop.store(true, Ordering::Relaxed);
+            let _ = e.handle.join();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Close every editor window (used at shutdown).
+fn close_all_editor_windows() {
+    let all: Vec<EditorThread> = editors().lock().unwrap().drain().map(|(_, e)| e).collect();
+    for e in &all {
+        e.stop.store(true, Ordering::Relaxed);
+    }
+    for e in all {
+        let _ = e.handle.join();
+    }
+}
+
 fn cleanup_connections() {
+    tracing::debug!("shutdown: closing editor windows");
+    close_all_editor_windows();
     tracing::debug!("shutdown: stopping audio");
     disconnect_all_audio();
     tracing::debug!("shutdown: stopping MIDI");
@@ -603,7 +678,7 @@ fn run_line(line: &str) -> bool {
         "help" => print_help(),
         "plugin" => {
             if parts.len() < 2 {
-                cmd_err!("usage: plugin <load|list|unload|show|preset|param|volume> ...");
+                cmd_err!("usage: plugin <load|list|unload|show|hide|preset|param|volume> ...");
             } else {
                 match parts[1].as_str() {
                     "load" => {
@@ -649,6 +724,8 @@ fn run_line(line: &str) -> bool {
                         if parts.len() < 3 {
                             cmd_err!("usage: plugin unload <plugin_id>");
                         } else if let Ok(id) = parts[2].parse::<u32>() {
+                            // The editor thread uses the plugin, so close its window first.
+                            close_editor_window(id);
                             if spaph_audio::active_ids().contains(&id) {
                                 let _ = spaph_audio::disarm(id);
                                 manager().lock().unwrap().clear_audio_device(id);
@@ -667,19 +744,22 @@ fn run_line(line: &str) -> bool {
                         if parts.len() < 3 {
                             cmd_err!("usage: plugin show <plugin_id>");
                         } else if let Ok(pid) = parts[2].parse::<u32>() {
-                            let mgr = manager().lock().unwrap();
-                            let inst = mgr.get_instance(pid);
-                            drop(mgr);
-                            if let Some(inst) = inst {
-                                let mut inst = inst.lock().unwrap();
-                                if !inst.has_editor() {
-                                    cmd_err!("plugin {} has no editor", pid);
-                                } else {
-                                    println!("opening editor for plugin {} (close window to continue)", pid);
-                                    if let Err(e) = inst.open_editor() {
-                                        cmd_err!("error: {}", e);
-                                    }
-                                }
+                            match open_editor_window(pid) {
+                                Ok(()) => println!("editor opened for plugin {} (plugin hide {} closes it)", pid, pid),
+                                Err(e) => cmd_err!("error: {}", e),
+                            }
+                        } else {
+                            cmd_err!("invalid plugin id");
+                        }
+                    }
+                    "hide" => {
+                        if parts.len() < 3 {
+                            cmd_err!("usage: plugin hide <plugin_id>");
+                        } else if let Ok(pid) = parts[2].parse::<u32>() {
+                            if close_editor_window(pid) {
+                                println!("editor closed for plugin {}", pid);
+                            } else if manager().lock().unwrap().get_instance(pid).is_some() {
+                                cmd_err!("plugin {} has no open editor", pid);
                             } else {
                                 cmd_err!("plugin {} not found", pid);
                             }

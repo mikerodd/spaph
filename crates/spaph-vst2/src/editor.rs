@@ -19,15 +19,19 @@ pub trait HostWindow {
 /// Delay between editor idle calls, roughly 60 Hz.
 pub const IDLE_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Open `editor` in `window` and service it until the window is closed.
+/// Open `editor` in `window` and service it until the window is closed or `stop` is set.
 ///
 /// Mirrors the VST3 editor loop: the plugin is opened, `idle` is called regularly,
-/// and `close` is called when the user closes the window.
-pub fn run_editor(editor: &mut dyn Editor, window: &mut dyn HostWindow) -> Result<()> {
+/// and `close` is called when the loop ends.
+pub fn run_editor(
+    editor: &mut dyn Editor,
+    window: &mut dyn HostWindow,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     if !editor.open(window.parent()) {
         return Err(SpaphError::Plugin("plugin editor failed to open".into()));
     }
-    while window.pump() {
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) && window.pump() {
         editor.idle();
         std::thread::sleep(IDLE_INTERVAL);
     }
@@ -285,6 +289,9 @@ mod win32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    static NO_STOP: AtomicBool = AtomicBool::new(false);
 
     struct FakeEditor {
         accept: bool,
@@ -346,7 +353,7 @@ mod tests {
     fn runs_idle_until_window_closed_then_closes_editor() {
         let mut editor = FakeEditor::new(true);
         let mut window = FakeWindow { alive: 3 };
-        run_editor(&mut editor, &mut window).unwrap();
+        run_editor(&mut editor, &mut window, &NO_STOP).unwrap();
         assert_eq!(editor.opens, 1);
         assert_eq!(editor.parent, 0x1234);
         assert_eq!(editor.idles, 3);
@@ -357,7 +364,7 @@ mod tests {
     fn window_closed_immediately_still_closes_editor() {
         let mut editor = FakeEditor::new(true);
         let mut window = FakeWindow { alive: 0 };
-        run_editor(&mut editor, &mut window).unwrap();
+        run_editor(&mut editor, &mut window, &NO_STOP).unwrap();
         assert_eq!(editor.idles, 0);
         assert_eq!(editor.closes, 1);
     }
@@ -366,17 +373,28 @@ mod tests {
     fn failed_open_is_an_error_and_does_not_close() {
         let mut editor = FakeEditor::new(false);
         let mut window = FakeWindow { alive: 5 };
-        assert!(run_editor(&mut editor, &mut window).is_err());
+        assert!(run_editor(&mut editor, &mut window, &NO_STOP).is_err());
         assert_eq!(editor.opens, 1);
         assert_eq!(editor.idles, 0);
         assert_eq!(editor.closes, 0);
     }
 
     #[test]
+    fn stop_flag_closes_editor_while_window_is_open() {
+        let stop = AtomicBool::new(true);
+        let mut editor = FakeEditor::new(true);
+        // Window never closes by itself; the stop flag must end the loop.
+        let mut window = FakeWindow { alive: usize::MAX };
+        run_editor(&mut editor, &mut window, &stop).unwrap();
+        assert_eq!(editor.idles, 0);
+        assert_eq!(editor.closes, 1);
+    }
+
+    #[test]
     fn editor_can_be_opened_again_after_close() {
         let mut editor = FakeEditor::new(true);
-        run_editor(&mut editor, &mut FakeWindow { alive: 1 }).unwrap();
-        run_editor(&mut editor, &mut FakeWindow { alive: 1 }).unwrap();
+        run_editor(&mut editor, &mut FakeWindow { alive: 1 }, &NO_STOP).unwrap();
+        run_editor(&mut editor, &mut FakeWindow { alive: 1 }, &NO_STOP).unwrap();
         assert_eq!(editor.opens, 2);
         assert_eq!(editor.closes, 2);
     }

@@ -24,6 +24,13 @@ pub struct PluginInfo {
     pub presets: Vec<String>,
 }
 
+/// A plugin editor window, runnable on any thread.
+pub trait EditorJob: Send {
+    /// Show the editor until `stop` is set or the user closes the window.
+    /// Returns once the window is closed; the editor is handed back to its instance.
+    fn run(self: Box<Self>, stop: &std::sync::atomic::AtomicBool) -> Result<()>;
+}
+
 /// A loaded plugin instance.
 pub trait PluginInstance: Send {
     fn info(&self) -> &PluginInfo;
@@ -53,10 +60,14 @@ pub trait PluginInstance: Send {
     fn select_preset(&mut self, _index: usize) -> Result<()> {
         Ok(())
     }
+    /// Whether the plugin has a graphical editor.
     fn has_editor(&self) -> bool {
         false
     }
-    fn open_editor(&mut self) -> Result<()> {
+    /// Take the editor as a job that can run on its own thread, without holding this
+    /// instance's lock, so audio and MIDI keep playing while the window is open.
+    /// The job must give the editor back to the instance when it finishes.
+    fn editor_job(&mut self) -> Result<Box<dyn EditorJob>> {
         Err(SpaphError::Plugin("editor not supported".into()))
     }
     fn load_preset_file(&mut self, _path: &Path) -> Result<()> {

@@ -253,3 +253,21 @@ fn unknown_audio_backend_in_config_exits_with_message() {
     assert!(err.contains("unknown audio backend 'no-such-backend'"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn plugin_hide_unknown_id_reports_error_without_panic() {
+    let dir = scratch("phide");
+    std::fs::write(dir.join("s.spaph"), "plugin hide 99\n").unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic: {err}");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(err.contains("plugin 99 not found"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
