@@ -24,11 +24,16 @@ pub struct PluginInfo {
     pub presets: Vec<String>,
 }
 
-/// A plugin editor window, runnable on any thread.
-pub trait EditorJob: Send {
-    /// Show the editor until `stop` is set or the user closes the window.
-    /// Returns once the window is closed; the editor is handed back to its instance.
-    fn run(self: Box<Self>, stop: &std::sync::atomic::AtomicBool) -> Result<()>;
+/// An open plugin editor window.
+///
+/// Plugins (VST3 in particular) must be driven from the thread that loaded them, so a session
+/// is created and serviced only on that thread. `tick` is called regularly from the console
+/// loop, which keeps the prompt responsive without a separate UI thread.
+pub trait EditorSession {
+    /// Service the window once. Returns `false` once the window has been closed.
+    fn tick(&mut self) -> bool;
+    /// Close the window and hand the editor back to its plugin instance.
+    fn close(self: Box<Self>);
 }
 
 /// A loaded plugin instance.
@@ -64,10 +69,9 @@ pub trait PluginInstance: Send {
     fn has_editor(&self) -> bool {
         false
     }
-    /// Take the editor as a job that can run on its own thread, without holding this
-    /// instance's lock, so audio and MIDI keep playing while the window is open.
-    /// The job must give the editor back to the instance when it finishes.
-    fn editor_job(&mut self) -> Result<Box<dyn EditorJob>> {
+    /// Open the editor window. Returns at once; the caller services it with `tick` until the
+    /// window is closed or `close` is called. Audio and MIDI keep running meanwhile.
+    fn open_editor_session(&mut self) -> Result<Box<dyn EditorSession>> {
         Err(SpaphError::Plugin("editor not supported".into()))
     }
     fn load_preset_file(&mut self, _path: &Path) -> Result<()> {

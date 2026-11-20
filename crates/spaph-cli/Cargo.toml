@@ -31,4 +31,4 @@ rustyline = { workspace = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "consoleapi", "processenv", "winbase", "handleapi", "wincon", "ole2"] }
+winapi = { version = "0.3", features = ["winuser", "consoleapi", "processenv", "winbase", "handleapi", "wincon"] }

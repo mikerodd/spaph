@@ -548,151 +548,86 @@ fn restore_terminal() {
     }
 }
 
-/// How long closing an editor window may take before we stop waiting for it.
-const EDITOR_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Interval between console-loop passes that service open editor windows (about 60 Hz).
+const EDITOR_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
-/// Initialises OLE/COM on the current thread for the lifetime of the guard (Windows only).
-///
-/// Plugin GUIs expect a single-threaded COM apartment on the thread that creates their
-/// window, and the plugin was loaded on another thread, so each editor thread sets one up.
-struct UiApartment {
-    #[cfg(windows)]
-    initialized: bool,
+/// The thread that owns the console. Plugins are loaded here, and their editor windows must be
+/// created and serviced here too (VST3 in particular is bound to the thread that loaded it).
+static CONSOLE_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+fn on_console_thread() -> bool {
+    CONSOLE_THREAD.get().map_or(false, |id| *id == std::thread::current().id())
 }
 
-impl UiApartment {
-    fn enter() -> Self {
-        #[cfg(windows)]
-        unsafe {
-            use winapi::um::ole2::OleInitialize;
-            // S_OK and S_FALSE (already initialised) both succeed; negative values are errors.
-            let hr = OleInitialize(std::ptr::null_mut());
-            if hr < 0 {
-                tracing::warn!("OleInitialize failed for editor thread: HRESULT {:#x}", hr);
-            }
-            UiApartment { initialized: hr >= 0 }
-        }
-        #[cfg(not(windows))]
-        UiApartment {}
-    }
-}
+/// An open editor window. Only ever touched on the console thread.
+struct OpenEditor(Box<dyn spaph_plugin::EditorSession>);
 
-// winapi 0.3 does not bind OleUninitialize, so declare it here (exported by ole32).
-#[cfg(windows)]
-#[link(name = "ole32")]
-unsafe extern "system" {
-    fn OleUninitialize();
-}
+// SAFETY: sessions are created, ticked and closed only on the console thread (enforced by
+// `open_editor_window`); the mutex is only needed to reach the registry from a static.
+unsafe impl Send for OpenEditor {}
 
-impl Drop for UiApartment {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        if self.initialized {
-            unsafe { OleUninitialize() };
-        }
-    }
-}
-
-/// Result of asking an editor window to close.
-#[derive(Debug, PartialEq, Eq)]
-enum EditorClose {
-    NotOpen,
-    Closed,
-    /// The window did not close in time; its thread is still running.
-    TimedOut,
-}
-
-/// A plugin editor window running on its own thread.
-struct EditorThread {
-    stop: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<()>,
-}
-
-static EDITORS: std::sync::OnceLock<Mutex<std::collections::HashMap<u32, EditorThread>>> =
+static EDITORS: std::sync::OnceLock<Mutex<std::collections::HashMap<u32, OpenEditor>>> =
     std::sync::OnceLock::new();
 
-fn editors() -> &'static Mutex<std::collections::HashMap<u32, EditorThread>> {
+fn editors() -> &'static Mutex<std::collections::HashMap<u32, OpenEditor>> {
     EDITORS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Open the editor of plugin `pid` on its own thread and return at once, so the prompt,
-/// MIDI and audio keep running. The window is closed with `plugin hide` or by the user.
+/// Open the editor window of plugin `pid`. Returns at once; the window is serviced by
+/// `pump_editors` from the console loop, so the prompt, MIDI and audio keep running.
 fn open_editor_window(pid: u32) -> std::result::Result<(), String> {
-    {
-        let mut map = editors().lock().unwrap();
-        // Forget windows the user already closed.
-        let finished: Vec<u32> = map.iter().filter(|(_, e)| e.handle.is_finished()).map(|(id, _)| *id).collect();
-        for id in finished {
-            if let Some(e) = map.remove(&id) {
-                let _ = e.handle.join();
-            }
-        }
-        if map.contains_key(&pid) {
-            return Err(format!("editor for plugin {} is already open", pid));
-        }
+    if !on_console_thread() {
+        return Err("plugin show/hide must be used from the console or a script".into());
+    }
+    if editors().lock().unwrap().contains_key(&pid) {
+        return Err(format!("editor for plugin {} is already open", pid));
     }
     let inst = manager()
         .lock()
         .unwrap()
         .get_instance(pid)
         .ok_or_else(|| format!("plugin {} not found", pid))?;
-    // Hold the instance lock only to take the editor, not while the window is open.
-    let job = inst.lock().unwrap().editor_job().map_err(|e| e.to_string())?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = stop.clone();
-    let handle = std::thread::spawn(move || {
-        let _apartment = UiApartment::enter();
-        tracing::debug!("editor thread for plugin {} started", pid);
-        if let Err(e) = job.run(&thread_stop) {
-            eprintln!("editor for plugin {}: {}", pid, e);
-        }
-        tracing::debug!("editor thread for plugin {} finished", pid);
-    });
-    editors().lock().unwrap().insert(pid, EditorThread { stop, handle });
+    // The instance lock is held only while the window is created, not while it is open.
+    let session = inst.lock().unwrap().open_editor_session().map_err(|e| e.to_string())?;
+    editors().lock().unwrap().insert(pid, OpenEditor(session));
     Ok(())
 }
 
-/// Wait up to `timeout` for an editor thread to finish. Returns `true` if it finished.
-fn wait_for_editor(e: EditorThread, timeout: std::time::Duration) -> bool {
-    let start = std::time::Instant::now();
-    while !e.handle.is_finished() {
-        if start.elapsed() >= timeout {
-            // Leave the thread running rather than block quit or unload on it.
-            return false;
+/// Service every open editor window once. Windows the user has closed are released.
+fn pump_editors() {
+    let mut map = editors().lock().unwrap();
+    let closed: Vec<u32> = map
+        .iter_mut()
+        .filter_map(|(id, e)| if e.0.tick() { None } else { Some(*id) })
+        .collect();
+    for id in closed {
+        if let Some(e) = map.remove(&id) {
+            e.0.close();
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let _ = e.handle.join();
-    true
 }
 
-/// Close the editor window of plugin `pid`, waiting at most `EDITOR_CLOSE_TIMEOUT`.
-fn close_editor_window(pid: u32) -> EditorClose {
+/// Close the editor window of plugin `pid`. Returns `false` if no window was open.
+fn close_editor_window(pid: u32) -> bool {
     let entry = editors().lock().unwrap().remove(&pid);
     match entry {
-        None => EditorClose::NotOpen,
         Some(e) => {
-            e.stop.store(true, Ordering::Relaxed);
-            if wait_for_editor(e, EDITOR_CLOSE_TIMEOUT) {
-                EditorClose::Closed
-            } else {
-                EditorClose::TimedOut
-            }
+            e.0.close();
+            true
         }
+        None => false,
     }
 }
 
-/// Close every editor window (used at shutdown). Windows that do not close in time are
-/// left behind; shutdown then exits without waiting for them.
+/// Close every editor window (shutdown and disconnect). Only the console thread may do this;
+/// from any other thread the windows are left open and are closed by the console later.
 fn close_all_editor_windows() {
-    let all: Vec<EditorThread> = editors().lock().unwrap().drain().map(|(_, e)| e).collect();
-    for e in &all {
-        e.stop.store(true, Ordering::Relaxed);
+    if !on_console_thread() {
+        return;
     }
+    let all: Vec<OpenEditor> = editors().lock().unwrap().drain().map(|(_, e)| e).collect();
     for e in all {
-        if !wait_for_editor(e, EDITOR_CLOSE_TIMEOUT) {
-            eprintln!("warning: an editor window did not close in time; exiting anyway");
-        }
+        e.0.close();
     }
 }
 
@@ -724,6 +659,9 @@ const SHUTDOWN_TIMEOUT_SECS: u64 = 6;
 /// Runs on a helper thread with a timeout, so a plugin whose teardown hangs cannot freeze
 /// the program: after the timeout a warning is printed and the process exits anyway.
 fn shutdown(code: i32) -> ! {
+    // Editor windows must be closed on the console thread that created them, so do it here
+    // rather than inside the timed helper thread below.
+    close_all_editor_windows();
     let finished = spaph_core::run_with_timeout(
         || {
             cleanup_connections();
@@ -806,19 +744,17 @@ fn run_line(line: &str) -> bool {
                             cmd_err!("usage: plugin unload <plugin_id>");
                         } else if let Ok(id) = parts[2].parse::<u32>() {
                             // The editor thread uses the plugin, so close its window first.
-                            if close_editor_window(id) == EditorClose::TimedOut {
-                                cmd_err!("editor window of plugin {} did not close; plugin kept loaded", id);
-                            } else {
-                                if spaph_audio::active_ids().contains(&id) {
-                                    let _ = spaph_audio::disarm(id);
-                                    manager().lock().unwrap().clear_audio_device(id);
-                                }
-                                let mut mgr = manager().lock().unwrap();
-                                mgr.clear_audio_device(id);
-                                match mgr.unload(id) {
-                                    Ok(_) => println!("unloaded {}", id),
-                                    Err(e) => cmd_err!("error: {}", e),
-                                }
+                            // The editor window uses the plugin, so close it first.
+                            close_editor_window(id);
+                            if spaph_audio::active_ids().contains(&id) {
+                                let _ = spaph_audio::disarm(id);
+                                manager().lock().unwrap().clear_audio_device(id);
+                            }
+                            let mut mgr = manager().lock().unwrap();
+                            mgr.clear_audio_device(id);
+                            match mgr.unload(id) {
+                                Ok(_) => println!("unloaded {}", id),
+                                Err(e) => cmd_err!("error: {}", e),
                             }
                         } else {
                             cmd_err!("invalid plugin id");
@@ -840,16 +776,12 @@ fn run_line(line: &str) -> bool {
                         if parts.len() < 3 {
                             cmd_err!("usage: plugin hide <plugin_id>");
                         } else if let Ok(pid) = parts[2].parse::<u32>() {
-                            match close_editor_window(pid) {
-                                EditorClose::Closed => println!("editor closed for plugin {}", pid),
-                                EditorClose::TimedOut => cmd_err!("editor window of plugin {} did not close in time", pid),
-                                EditorClose::NotOpen => {
-                                    if manager().lock().unwrap().get_instance(pid).is_some() {
-                                        cmd_err!("plugin {} has no open editor", pid);
-                                    } else {
-                                        cmd_err!("plugin {} not found", pid);
-                                    }
-                                }
+                            if close_editor_window(pid) {
+                                println!("editor closed for plugin {}", pid);
+                            } else if manager().lock().unwrap().get_instance(pid).is_some() {
+                                cmd_err!("plugin {} has no open editor", pid);
+                            } else {
+                                cmd_err!("plugin {} not found", pid);
                             }
                         } else {
                             cmd_err!("invalid plugin id");
@@ -1364,17 +1296,23 @@ fn run_shell(osc_port: u16) {
     });
     *stdin_thread_slot().lock().unwrap() = Some(handle);
 
+    // Wait for commands, but wake up regularly to service open editor windows. The prompt
+    // itself runs on its own thread, so this loop never blocks the console.
     loop {
-        match line_rx.recv() {
+        match line_rx.recv_timeout(EDITOR_FRAME) {
             Ok(line) => {
                 if !run_line(&line) {
                     break;
                 }
                 let _ = ack_tx.send(());
             }
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        pump_editors();
     }
+    // Close editor windows on this thread, which created them.
+    close_all_editor_windows();
     // Disconnecting the ack channel wakes the reader thread so it exits without needing input.
     drop(ack_tx);
     // Signal the stdin thread to stop and wait briefly for it to restore the terminal.
@@ -1447,6 +1385,7 @@ fn run_script(path: &Path) -> std::result::Result<(), String> {
 }
 
 fn main() {
+    let _ = CONSOLE_THREAD.set(std::thread::current().id());
     let cli = Cli::parse();
     let (config_path, mut cfg) = load_startup_config(&cli);
 

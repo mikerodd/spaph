@@ -2,7 +2,7 @@
 
 #![allow(deprecated)]
 
-use spaph_plugin::{EditorJob, ParamInfo, PluginFactory, PluginInfo as SpaphPluginInfo, PluginInstance as SpaphPluginInstance};
+use spaph_plugin::{EditorSession, ParamInfo, PluginFactory, PluginInfo as SpaphPluginInfo, PluginInstance as SpaphPluginInstance};
 use spaph_types::{MidiEvent, PluginFormat, Result, SpaphError};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -91,38 +91,45 @@ impl PluginFactory for Vst2Factory {
     }
 }
 
-/// The plugin's `Editor` object. It only talks to the plugin through the parameter object and
-/// is moved between the instance and one editor thread at a time, never used concurrently.
+/// The plugin's `Editor` object. It is only used on the console thread, which owns the
+/// plugin; it is moved in and out of the instance's slot, never shared.
 struct SendEditor(Box<dyn Editor>);
 
-// SAFETY: see the type comment; ownership is handed over, never shared.
+// SAFETY: the editor is only touched on the console thread that loaded the plugin.
 unsafe impl Send for SendEditor {}
 
-/// An editor window that runs on its own thread and gives the editor back when it closes.
-struct Vst2EditorJob {
+/// An open VST2 editor window. Dropping or closing it returns the editor to the instance.
+struct Vst2Session {
     editor: Option<SendEditor>,
+    window: Box<dyn editor::HostWindow>,
     slot: Arc<Mutex<Option<SendEditor>>>,
-    title: String,
 }
 
-impl EditorJob for Vst2EditorJob {
-    fn run(mut self: Box<Self>, stop: &std::sync::atomic::AtomicBool) -> spaph_types::Result<()> {
-        let mut editor = self.editor.take().expect("editor job runs once");
-        let (width, height) = editor.0.size();
-        let result = editor::open_window(&self.title, width, height)
-            .and_then(|mut window| editor::run_editor(editor.0.as_mut(), window.as_mut(), stop));
-        // The window is gone by now; the editor can be opened again later.
-        *self.slot.lock().unwrap() = Some(editor);
-        result
+impl Vst2Session {
+    fn release(&mut self) {
+        if let Some(mut editor) = self.editor.take() {
+            editor::detach(editor.0.as_mut());
+            *self.slot.lock().unwrap() = Some(editor);
+        }
     }
 }
 
-impl Drop for Vst2EditorJob {
-    fn drop(&mut self) {
-        // A job that never ran must not lose the editor.
-        if let Some(editor) = self.editor.take() {
-            *self.slot.lock().unwrap() = Some(editor);
+impl EditorSession for Vst2Session {
+    fn tick(&mut self) -> bool {
+        match self.editor.as_mut() {
+            Some(editor) => editor::tick(editor.0.as_mut(), self.window.as_mut()),
+            None => false,
         }
+    }
+
+    fn close(mut self: Box<Self>) {
+        self.release();
+    }
+}
+
+impl Drop for Vst2Session {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -132,7 +139,7 @@ pub struct Vst2Instance {
     fx_id: i32,
     fx_version: i32,
     has_gui: bool,
-    /// The editor while no window is open; taken by `editor_job` and returned on close.
+    /// The editor while no window is open; taken by `open_editor_session` and returned on close.
     editor_slot: Arc<Mutex<Option<SendEditor>>>,
     _instance: vst::host::PluginInstance,
     sample_rate: f64,
@@ -249,21 +256,33 @@ impl SpaphPluginInstance for Vst2Instance {
         self.has_gui
     }
 
-    fn editor_job(&mut self) -> Result<Box<dyn EditorJob>> {
+    fn open_editor_session(&mut self) -> Result<Box<dyn EditorSession>> {
         if !self.has_gui {
             return Err(SpaphError::Plugin("plugin has no editor".into()));
         }
-        let editor = self
+        let mut editor = self
             .editor_slot
             .lock()
             .unwrap()
             .take()
             .ok_or_else(|| SpaphError::Plugin("editor is already open".into()))?;
-        Ok(Box::new(Vst2EditorJob {
-            editor: Some(editor),
-            slot: self.editor_slot.clone(),
-            title: self.info.name.clone(),
-        }))
+        let (width, height) = editor.0.size();
+        let attached = editor::open_window(&self.info.name, width, height).and_then(|mut window| {
+            editor::attach(editor.0.as_mut(), window.as_mut())?;
+            Ok(window)
+        });
+        match attached {
+            Ok(window) => Ok(Box::new(Vst2Session {
+                editor: Some(editor),
+                window,
+                slot: self.editor_slot.clone(),
+            })),
+            Err(e) => {
+                // Nothing was opened: give the editor back so it can be tried again later.
+                *self.editor_slot.lock().unwrap() = Some(editor);
+                Err(e)
+            }
+        }
     }
 
     fn save_preset_file(&self, path: &std::path::Path) -> Result<()> {

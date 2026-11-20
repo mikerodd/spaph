@@ -5,7 +5,6 @@
 
 use spaph_types::{Result, SpaphError};
 use std::ffi::c_void;
-use std::time::Duration;
 use vst::editor::Editor;
 
 /// A native window that hosts a plugin editor.
@@ -16,27 +15,27 @@ pub trait HostWindow {
     fn pump(&mut self) -> bool;
 }
 
-/// Delay between editor idle calls, roughly 60 Hz.
-pub const IDLE_INTERVAL: Duration = Duration::from_millis(16);
-
-/// Open `editor` in `window` and service it until the window is closed or `stop` is set.
-///
-/// Mirrors the VST3 editor loop: the plugin is opened, `idle` is called regularly,
-/// and `close` is called when the loop ends.
-pub fn run_editor(
-    editor: &mut dyn Editor,
-    window: &mut dyn HostWindow,
-    stop: &std::sync::atomic::AtomicBool,
-) -> Result<()> {
+/// Open the plugin editor inside `window`. Must run on the thread that owns the window.
+pub fn attach(editor: &mut dyn Editor, window: &mut dyn HostWindow) -> Result<()> {
     if !editor.open(window.parent()) {
         return Err(SpaphError::Plugin("plugin editor failed to open".into()));
     }
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) && window.pump() {
-        editor.idle();
-        std::thread::sleep(IDLE_INTERVAL);
-    }
-    editor.close();
     Ok(())
+}
+
+/// Service the window once: process its events, then give the plugin an idle call.
+/// Returns `false` once the user has closed the window.
+pub fn tick(editor: &mut dyn Editor, window: &mut dyn HostWindow) -> bool {
+    if !window.pump() {
+        return false;
+    }
+    editor.idle();
+    true
+}
+
+/// Close the plugin editor. The window itself is destroyed when its owner drops it.
+pub fn detach(editor: &mut dyn Editor) {
+    editor.close();
 }
 
 /// Create a native window of the given client size for hosting an editor.
@@ -289,9 +288,6 @@ mod win32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-
-    static NO_STOP: AtomicBool = AtomicBool::new(false);
 
     struct FakeEditor {
         accept: bool,
@@ -350,51 +346,44 @@ mod tests {
     }
 
     #[test]
-    fn runs_idle_until_window_closed_then_closes_editor() {
+    fn tick_idles_while_window_open_and_reports_close() {
         let mut editor = FakeEditor::new(true);
-        let mut window = FakeWindow { alive: 3 };
-        run_editor(&mut editor, &mut window, &NO_STOP).unwrap();
+        let mut window = FakeWindow { alive: 2 };
+        attach(&mut editor, &mut window).unwrap();
+        assert!(tick(&mut editor, &mut window));
+        assert!(tick(&mut editor, &mut window));
+        assert!(!tick(&mut editor, &mut window), "window closed by user");
         assert_eq!(editor.opens, 1);
         assert_eq!(editor.parent, 0x1234);
-        assert_eq!(editor.idles, 3);
-        assert_eq!(editor.closes, 1);
+        assert_eq!(editor.idles, 2, "no idle call once the window is closed");
     }
 
     #[test]
-    fn window_closed_immediately_still_closes_editor() {
+    fn detach_closes_the_editor() {
         let mut editor = FakeEditor::new(true);
-        let mut window = FakeWindow { alive: 0 };
-        run_editor(&mut editor, &mut window, &NO_STOP).unwrap();
-        assert_eq!(editor.idles, 0);
+        let mut window = FakeWindow { alive: 1 };
+        attach(&mut editor, &mut window).unwrap();
+        detach(&mut editor);
         assert_eq!(editor.closes, 1);
     }
 
     #[test]
-    fn failed_open_is_an_error_and_does_not_close() {
+    fn failed_attach_is_an_error_and_does_not_idle() {
         let mut editor = FakeEditor::new(false);
         let mut window = FakeWindow { alive: 5 };
-        assert!(run_editor(&mut editor, &mut window, &NO_STOP).is_err());
+        assert!(attach(&mut editor, &mut window).is_err());
         assert_eq!(editor.opens, 1);
         assert_eq!(editor.idles, 0);
         assert_eq!(editor.closes, 0);
     }
 
     #[test]
-    fn stop_flag_closes_editor_while_window_is_open() {
-        let stop = AtomicBool::new(true);
+    fn editor_can_be_attached_again_after_detach() {
         let mut editor = FakeEditor::new(true);
-        // Window never closes by itself; the stop flag must end the loop.
-        let mut window = FakeWindow { alive: usize::MAX };
-        run_editor(&mut editor, &mut window, &stop).unwrap();
-        assert_eq!(editor.idles, 0);
-        assert_eq!(editor.closes, 1);
-    }
-
-    #[test]
-    fn editor_can_be_opened_again_after_close() {
-        let mut editor = FakeEditor::new(true);
-        run_editor(&mut editor, &mut FakeWindow { alive: 1 }, &NO_STOP).unwrap();
-        run_editor(&mut editor, &mut FakeWindow { alive: 1 }, &NO_STOP).unwrap();
+        attach(&mut editor, &mut FakeWindow { alive: 1 }).unwrap();
+        detach(&mut editor);
+        attach(&mut editor, &mut FakeWindow { alive: 1 }).unwrap();
+        detach(&mut editor);
         assert_eq!(editor.opens, 2);
         assert_eq!(editor.closes, 2);
     }
