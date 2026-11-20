@@ -580,7 +580,7 @@ impl UiApartment {
 // winapi 0.3 does not bind OleUninitialize, so declare it here (exported by ole32).
 #[cfg(windows)]
 #[link(name = "ole32")]
-extern "system" {
+unsafe extern "system" {
     fn OleUninitialize();
 }
 
