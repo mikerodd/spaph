@@ -651,6 +651,11 @@ fn shutdown(code: i32) -> ! {
     let finished = spaph_core::run_with_timeout(
         || {
             cleanup_connections();
+            // Stop the output stream before the process exits. With ASIO the driver keeps its
+            // callback running until the stream is dropped, which can block at exit.
+            tracing::debug!("shutdown: stopping output stream");
+            spaph_audio::stop_stream();
+            tracing::debug!("shutdown: output stream stopped");
             let plugins = manager().lock().unwrap().take_all();
             tracing::debug!("shutdown: unloading {} plugin(s)", plugins.len());
             drop(plugins);
@@ -1292,7 +1297,7 @@ fn run_shell(osc_port: u16) {
     // Signal the stdin thread to stop and wait briefly for it to restore the terminal.
     stdin_stop().store(true, std::sync::atomic::Ordering::Relaxed);
     restore_terminal();
-    cleanup_connections();
+    // Teardown (including the audio stream) runs in shutdown(), under its timeout.
 }
 
 
