@@ -548,6 +548,60 @@ fn restore_terminal() {
     }
 }
 
+/// How long closing an editor window may take before we stop waiting for it.
+const EDITOR_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Initialises OLE/COM on the current thread for the lifetime of the guard (Windows only).
+///
+/// Plugin GUIs expect a single-threaded COM apartment on the thread that creates their
+/// window, and the plugin was loaded on another thread, so each editor thread sets one up.
+struct UiApartment {
+    #[cfg(windows)]
+    initialized: bool,
+}
+
+impl UiApartment {
+    fn enter() -> Self {
+        #[cfg(windows)]
+        unsafe {
+            use winapi::um::ole2::OleInitialize;
+            // S_OK and S_FALSE (already initialised) both succeed; negative values are errors.
+            let hr = OleInitialize(std::ptr::null_mut());
+            if hr < 0 {
+                tracing::warn!("OleInitialize failed for editor thread: HRESULT {:#x}", hr);
+            }
+            UiApartment { initialized: hr >= 0 }
+        }
+        #[cfg(not(windows))]
+        UiApartment {}
+    }
+}
+
+// winapi 0.3 does not bind OleUninitialize, so declare it here (exported by ole32).
+#[cfg(windows)]
+#[link(name = "ole32")]
+extern "system" {
+    fn OleUninitialize();
+}
+
+impl Drop for UiApartment {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.initialized {
+            unsafe { OleUninitialize() };
+        }
+    }
+}
+
+/// Result of asking an editor window to close.
+#[derive(Debug, PartialEq, Eq)]
+enum EditorClose {
+    NotOpen,
+    Closed,
+    /// The window did not close in time; its thread is still running.
+    TimedOut,
+}
+
 /// A plugin editor window running on its own thread.
 struct EditorThread {
     stop: Arc<AtomicBool>,
@@ -587,36 +641,58 @@ fn open_editor_window(pid: u32) -> std::result::Result<(), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let handle = std::thread::spawn(move || {
+        let _apartment = UiApartment::enter();
+        tracing::debug!("editor thread for plugin {} started", pid);
         if let Err(e) = job.run(&thread_stop) {
             eprintln!("editor for plugin {}: {}", pid, e);
         }
+        tracing::debug!("editor thread for plugin {} finished", pid);
     });
     editors().lock().unwrap().insert(pid, EditorThread { stop, handle });
     Ok(())
 }
 
-/// Close the editor window of plugin `pid` and wait until it is gone. Returns `false` if no
-/// window was open.
-fn close_editor_window(pid: u32) -> bool {
+/// Wait up to `timeout` for an editor thread to finish. Returns `true` if it finished.
+fn wait_for_editor(e: EditorThread, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    while !e.handle.is_finished() {
+        if start.elapsed() >= timeout {
+            // Leave the thread running rather than block quit or unload on it.
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = e.handle.join();
+    true
+}
+
+/// Close the editor window of plugin `pid`, waiting at most `EDITOR_CLOSE_TIMEOUT`.
+fn close_editor_window(pid: u32) -> EditorClose {
     let entry = editors().lock().unwrap().remove(&pid);
     match entry {
+        None => EditorClose::NotOpen,
         Some(e) => {
             e.stop.store(true, Ordering::Relaxed);
-            let _ = e.handle.join();
-            true
+            if wait_for_editor(e, EDITOR_CLOSE_TIMEOUT) {
+                EditorClose::Closed
+            } else {
+                EditorClose::TimedOut
+            }
         }
-        None => false,
     }
 }
 
-/// Close every editor window (used at shutdown).
+/// Close every editor window (used at shutdown). Windows that do not close in time are
+/// left behind; shutdown then exits without waiting for them.
 fn close_all_editor_windows() {
     let all: Vec<EditorThread> = editors().lock().unwrap().drain().map(|(_, e)| e).collect();
     for e in &all {
         e.stop.store(true, Ordering::Relaxed);
     }
     for e in all {
-        let _ = e.handle.join();
+        if !wait_for_editor(e, EDITOR_CLOSE_TIMEOUT) {
+            eprintln!("warning: an editor window did not close in time; exiting anyway");
+        }
     }
 }
 
@@ -730,16 +806,19 @@ fn run_line(line: &str) -> bool {
                             cmd_err!("usage: plugin unload <plugin_id>");
                         } else if let Ok(id) = parts[2].parse::<u32>() {
                             // The editor thread uses the plugin, so close its window first.
-                            close_editor_window(id);
-                            if spaph_audio::active_ids().contains(&id) {
-                                let _ = spaph_audio::disarm(id);
-                                manager().lock().unwrap().clear_audio_device(id);
-                            }
-                            let mut mgr = manager().lock().unwrap();
-                            mgr.clear_audio_device(id);
-                            match mgr.unload(id) {
-                                Ok(_) => println!("unloaded {}", id),
-                                Err(e) => cmd_err!("error: {}", e),
+                            if close_editor_window(id) == EditorClose::TimedOut {
+                                cmd_err!("editor window of plugin {} did not close; plugin kept loaded", id);
+                            } else {
+                                if spaph_audio::active_ids().contains(&id) {
+                                    let _ = spaph_audio::disarm(id);
+                                    manager().lock().unwrap().clear_audio_device(id);
+                                }
+                                let mut mgr = manager().lock().unwrap();
+                                mgr.clear_audio_device(id);
+                                match mgr.unload(id) {
+                                    Ok(_) => println!("unloaded {}", id),
+                                    Err(e) => cmd_err!("error: {}", e),
+                                }
                             }
                         } else {
                             cmd_err!("invalid plugin id");
@@ -761,12 +840,16 @@ fn run_line(line: &str) -> bool {
                         if parts.len() < 3 {
                             cmd_err!("usage: plugin hide <plugin_id>");
                         } else if let Ok(pid) = parts[2].parse::<u32>() {
-                            if close_editor_window(pid) {
-                                println!("editor closed for plugin {}", pid);
-                            } else if manager().lock().unwrap().get_instance(pid).is_some() {
-                                cmd_err!("plugin {} has no open editor", pid);
-                            } else {
-                                cmd_err!("plugin {} not found", pid);
+                            match close_editor_window(pid) {
+                                EditorClose::Closed => println!("editor closed for plugin {}", pid),
+                                EditorClose::TimedOut => cmd_err!("editor window of plugin {} did not close in time", pid),
+                                EditorClose::NotOpen => {
+                                    if manager().lock().unwrap().get_instance(pid).is_some() {
+                                        cmd_err!("plugin {} has no open editor", pid);
+                                    } else {
+                                        cmd_err!("plugin {} not found", pid);
+                                    }
+                                }
                             }
                         } else {
                             cmd_err!("invalid plugin id");

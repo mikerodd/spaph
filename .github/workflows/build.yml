@@ -84,13 +84,9 @@ jobs:
         run: cargo build --release --target x86_64-pc-windows-msvc --features spaph-audio/asio
       - name: Test
         run: cargo test --workspace
-      - name: Package
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp target/x86_64-pc-windows-msvc/release/spaph.exe dist/
-          cd dist && 7z a ../spaph-windows-x86_64.zip spaph.exe
+      # upload-artifact already zips the files it is given, so upload the exe directly
+      # (no inner zip). The result is a single spaph-windows-x86_64.zip containing spaph.exe.
       - uses: actions/upload-artifact@v7
         with:
           name: spaph-windows-x86_64
-          path: spaph-windows-x86_64.zip
+          path: target/x86_64-pc-windows-msvc/release/spaph.exe
