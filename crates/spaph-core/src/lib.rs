@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[derive(Debug, Clone)]
 pub struct PluginSummary {
     pub id: u32,
+    pub alias: Option<String>,
     pub name: String,
     pub vendor: String,
     pub format: PluginFormat,
@@ -19,8 +20,27 @@ pub struct PluginSummary {
     pub path: PathBuf,
 }
 
+/// Check that `alias` can be used as a plugin name: a plain word (ASCII letters, digits,
+/// `_` or `-`), not starting with a digit (so it cannot be mistaken for an id), and not the
+/// keyword `all`. Matching is case-sensitive.
+pub fn validate_alias(alias: &str) -> Result<()> {
+    let first_ok = alias.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_');
+    let rest_ok = alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !first_ok || !rest_ok {
+        return Err(SpaphError::Plugin(format!(
+            "invalid alias '{}': use letters, digits, '_' or '-', starting with a letter or '_'",
+            alias
+        )));
+    }
+    if alias == "all" {
+        return Err(SpaphError::Plugin("alias 'all' is reserved".into()));
+    }
+    Ok(())
+}
+
 pub struct LoadedPlugin {
     pub id: u32,
+    pub alias: Option<String>,
     pub path: PathBuf,
     pub info: SpaphPluginInfo,
     pub instance: std::sync::Arc<std::sync::Mutex<Box<dyn PluginInstance>>>,
@@ -58,6 +78,18 @@ impl PluginManager {
     }
 
     pub fn load(&mut self, path: &Path) -> Result<u32> {
+        self.load_as(path, None)
+    }
+
+    /// Load a plugin, optionally giving it an alias usable in place of its id.
+    /// The alias is validated and checked for uniqueness before the plugin is loaded.
+    pub fn load_as(&mut self, path: &Path, alias: Option<&str>) -> Result<u32> {
+        if let Some(a) = alias {
+            validate_alias(a)?;
+            if self.plugins.iter().any(|p| p.alias.as_deref() == Some(a)) {
+                return Err(SpaphError::Plugin(format!("alias '{}' already in use", a)));
+            }
+        }
         let factory = Self::factory_for(path)
             .ok_or_else(|| SpaphError::Plugin("unknown plugin format".into()))?;
         if !factory.can_load(path) {
@@ -68,6 +100,7 @@ impl PluginManager {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.plugins.push(LoadedPlugin {
             id,
+            alias: alias.map(str::to_string),
             path: path.to_path_buf(),
             info,
             instance: std::sync::Arc::new(std::sync::Mutex::new(instance)),
@@ -89,11 +122,21 @@ impl PluginManager {
         Ok(())
     }
 
+    /// Resolve a command argument to a plugin id. A numeric token is the id itself; anything
+    /// else is looked up as an alias (case-sensitive). Returns `None` if no plugin matches.
+    pub fn resolve(&self, token: &str) -> Option<u32> {
+        if let Ok(id) = token.parse::<u32>() {
+            return Some(id);
+        }
+        self.plugins.iter().find(|p| p.alias.as_deref() == Some(token)).map(|p| p.id)
+    }
+
     pub fn list(&self) -> Vec<PluginSummary> {
         self.plugins
             .iter()
             .map(|p| PluginSummary {
                 id: p.id,
+                alias: p.alias.clone(),
                 name: p.info.name.clone(),
                 vendor: p.info.vendor.clone(),
                 format: p.info.format,
@@ -297,6 +340,7 @@ mod tests {
         let id = mgr.next_id.fetch_add(1, Ordering::SeqCst);
         mgr.plugins.push(LoadedPlugin {
             id,
+            alias: None,
             path: PathBuf::from("/mock"),
             info: mock_info(),
             instance: std::sync::Arc::new(std::sync::Mutex::new(Box::new(MockPlugin { info: mock_info() }))),
@@ -348,6 +392,78 @@ mod tests {
     fn unload_unknown_errors() {
         let mut mgr = PluginManager::new();
         assert!(mgr.unload(999).is_err());
+    }
+
+    #[test]
+    fn alias_resolves_to_id() {
+        let mut mgr = PluginManager::new();
+        let id = insert_mock(&mut mgr);
+        mgr.plugins[0].alias = Some("synth".into());
+        assert_eq!(mgr.resolve("synth"), Some(id));
+    }
+
+    #[test]
+    fn numeric_token_resolves_to_id_even_if_unknown() {
+        let mgr = PluginManager::new();
+        assert_eq!(mgr.resolve("7"), Some(7));
+    }
+
+    #[test]
+    fn unknown_alias_does_not_resolve() {
+        let mut mgr = PluginManager::new();
+        insert_mock(&mut mgr);
+        assert_eq!(mgr.resolve("nosuch"), None);
+    }
+
+    #[test]
+    fn alias_is_case_sensitive() {
+        let mut mgr = PluginManager::new();
+        let id = insert_mock(&mut mgr);
+        mgr.plugins[0].alias = Some("Synth".into());
+        assert_eq!(mgr.resolve("Synth"), Some(id));
+        assert_eq!(mgr.resolve("synth"), None);
+    }
+
+    #[test]
+    fn validate_alias_accepts_plain_words() {
+        for a in ["amsynth", "synth_1", "a-b", "_x", "Pad2"] {
+            assert!(validate_alias(a).is_ok(), "{a}");
+        }
+    }
+
+    #[test]
+    fn validate_alias_rejects_bad_names() {
+        for a in ["", "1synth", "-x", "all", "my synth", "a/b", "é", "a.b"] {
+            assert!(validate_alias(a).is_err(), "{a:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn alias_released_after_unload() {
+        let mut mgr = PluginManager::new();
+        let id = insert_mock(&mut mgr);
+        mgr.plugins[0].alias = Some("synth".into());
+        mgr.unload(id).unwrap();
+        assert_eq!(mgr.resolve("synth"), None);
+        // The name is free again (a later load would not be a duplicate).
+        assert!(mgr.plugins.iter().all(|p| p.alias.as_deref() != Some("synth")));
+    }
+
+    #[test]
+    fn load_as_rejects_invalid_alias_before_loading() {
+        let mut mgr = PluginManager::new();
+        let err = mgr.load_as(Path::new("/no/such.vst3"), Some("1bad")).unwrap_err();
+        assert!(err.to_string().contains("invalid alias"), "{err}");
+    }
+
+    #[test]
+    fn load_as_rejects_duplicate_alias_before_loading() {
+        let mut mgr = PluginManager::new();
+        let id = insert_mock(&mut mgr);
+        mgr.plugins[0].alias = Some("synth".into());
+        let err = mgr.load_as(Path::new("/no/such.vst3"), Some("synth")).unwrap_err();
+        assert!(err.to_string().contains("already in use"), "{err}");
+        assert_eq!(mgr.resolve("synth"), Some(id));
     }
 
     #[test]

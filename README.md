@@ -73,7 +73,7 @@ starting with `#` are ignored. A relative `script` path is relative to the confi
 
 ```
 # startup.spaph
-load /usr/lib/vst/amsynth_vst.so
+plugin load /usr/lib/vst/amsynth_vst.so
 select 1 5
 connect audio 1 0 48000 256
 ```
@@ -81,6 +81,18 @@ connect audio 1 0 48000 256
 - If a command fails, spaph prints the line and exits with code 1.
 - `quit` ends the script; the program keeps running and opens the prompt.
 - `midi listen` is interactive only: it is skipped with a warning in a script.
+- `load <script>` runs another script, path relative to the config file. It nests up to 8 levels.
+- `plugin unload all` unloads every plugin, disconnecting its audio and MIDI.
+- `plugin load <path> as <name>` gives a plugin an alias. Any command that takes a plugin id
+  also accepts the alias, e.g. `midi connect 0 synth`. Aliases are case-sensitive, must start
+  with a letter or `_`, may contain letters, digits, `_` and `-`, and cannot be `all`. An alias
+  is released when its plugin is unloaded, so it can be reused. Numeric ids keep working.
+
+## OSC
+
+Commands sent to `/spaph/command` (string argument) run on the console thread, so
+`plugin show` / `hide` work over OSC. Output is printed to the console. `quit` is ignored
+over OSC, and `midi listen` is skipped.
 
 ## License
 

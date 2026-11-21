@@ -88,8 +88,16 @@ impl LogLevel {
 
 /// True while a script line is being executed (see `run_script`).
 static IN_SCRIPT: AtomicBool = AtomicBool::new(false);
+/// True while a command received over OSC is being executed (non-interactive, like a script).
+static IN_OSC: AtomicBool = AtomicBool::new(false);
 /// Set by `cmd_err!` when a command fails; checked after each script line.
 static CMD_ERROR: AtomicBool = AtomicBool::new(false);
+/// Directory of the config file; relative `load` paths are resolved from it.
+static CONFIG_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+/// Current `load` nesting depth.
+static LOAD_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Maximum `load` nesting depth; deeper loads are refused with an error.
+const MAX_LOAD_DEPTH: u32 = 8;
 
 /// Print a command error and flag it, so a script can stop on it.
 macro_rules! cmd_err {
@@ -124,8 +132,14 @@ fn split_args(line: &str) -> Vec<String> {
     out
 }
 
-fn load_plugin(path: &PathBuf) -> Result<()> {
-    let id = manager().lock().unwrap().load(path)?;
+/// Resolve a plugin argument (numeric id or alias) to an id. Takes the manager lock, so it must
+/// not be called while the lock is already held.
+fn resolve_plugin_arg(token: &str) -> Option<u32> {
+    manager().lock().unwrap().resolve(token)
+}
+
+fn load_plugin(path: &PathBuf, alias: Option<&str>) -> Result<()> {
+    let id = manager().lock().unwrap().load_as(path, alias)?;
     let mgr = manager().lock().unwrap();
     let summary = mgr.list().into_iter().find(|s| s.id == id).unwrap();
     drop(mgr);
@@ -142,9 +156,9 @@ fn print_help() {
     println!("spaph - Simple Portable Audio Plugins Host");
     println!("Commands:");
     println!("  help                          Show this help");
-    println!("  plugin load <path>            Load a plugin and display its interface");
+    println!("  plugin load <path> [as <name>] Load a plugin and display its interface; optional alias");
     println!("  plugin list                   List loaded plugins");
-    println!("  plugin unload <id>            Unload a plugin by id");
+    println!("  plugin unload <id|all>        Unload a plugin by id or alias, or all plugins (also disconnects MIDI and audio)");
     println!("  plugin show <id>              Open plugin editor window (VST2 and VST3); prompt stays usable");
     println!("  plugin hide <id>              Close plugin editor window");
     println!("  plugin preset list <id>       List presets of a plugin");
@@ -168,6 +182,7 @@ fn print_help() {
     println!("  volume [<id>] <level>         Set host-side output gain (per plugin)");
     println!("  master <level>                Set master output gain");
     println!("  disconnect                    Stop all audio and MIDI connections");
+    println!("  load <script>                 Run a script file (relative to the config file folder)");
     println!("  quit | exit                   Exit the shell");
 }
 
@@ -437,6 +452,39 @@ fn disconnect_midi_filtered(
     Ok(())
 }
 
+/// Unload one plugin: close its editor, disconnect its audio and MIDI, then drop it.
+/// The manager lock must not be held by the caller, since the MIDI teardown takes it.
+fn unload_plugin(id: u32) -> std::result::Result<(), String> {
+    // The editor window uses the plugin, so close it first.
+    close_editor_window(id);
+    if spaph_audio::active_ids().contains(&id) {
+        let _ = spaph_audio::disarm(id);
+    }
+    // MIDI threads keep feeding the plugin's queue until stopped; "no matching connection"
+    // just means this plugin had no MIDI input.
+    let _ = disconnect_midi_filtered(None, Some(id), None);
+    let mut mgr = manager().lock().unwrap();
+    mgr.clear_audio_device(id);
+    mgr.unload(id).map_err(|e| e.to_string())
+}
+
+/// `plugin unload all`: unload every plugin, reporting each failure.
+fn unload_all_plugins() {
+    let ids: Vec<u32> = manager().lock().unwrap().list().iter().map(|p| p.id).collect();
+    if ids.is_empty() {
+        println!("no plugins to unload");
+        return;
+    }
+    let mut unloaded = 0;
+    for id in ids {
+        match unload_plugin(id) {
+            Ok(()) => unloaded += 1,
+            Err(e) => cmd_err!("error: plugin {}: {}", id, e),
+        }
+    }
+    println!("unloaded {} plugin(s)", unloaded);
+}
+
 fn disconnect_all_audio() {
     let armed = spaph_audio::active_ids();
     spaph_audio::disarm_all();
@@ -701,12 +749,19 @@ fn run_line(line: &str) -> bool {
             } else {
                 match parts[1].as_str() {
                     "load" => {
-                        if parts.len() < 3 {
-                            cmd_err!("usage: plugin load <path>");
-                        } else {
-                            let path = PathBuf::from(&parts[2]);
-                            if let Err(e) = load_plugin(&path) {
-                                cmd_err!("error: {}", e);
+                        // plugin load <path> [as <name>]
+                        let alias = match parts.len() {
+                            3 => Some(None),
+                            5 if parts[3] == "as" => Some(Some(parts[4].as_str())),
+                            _ => None,
+                        };
+                        match alias {
+                            None => cmd_err!("usage: plugin load <path> [as <name>]"),
+                            Some(alias) => {
+                                let path = PathBuf::from(&parts[2]);
+                                if let Err(e) = load_plugin(&path, alias) {
+                                    cmd_err!("error: {}", e);
+                                }
                             }
                         }
                     }
@@ -735,47 +790,41 @@ fn run_line(line: &str) -> bool {
                                 } else {
                                     "no".to_string()
                                 };
-                                println!("  #{} {} ({:?}) - {} params | midi: {} | audio: {}", p.id, p.name, p.format, p.num_params, midi_str, audio_str);
+                                let alias_str = p.alias.as_ref().map(|a| format!(" as {}", a)).unwrap_or_default();
+                                println!("  #{}{} {} ({:?}) - {} params | midi: {} | audio: {}", p.id, alias_str, p.name, p.format, p.num_params, midi_str, audio_str);
                             }
                         }
                     }
                     "unload" => {
                         if parts.len() < 3 {
-                            cmd_err!("usage: plugin unload <plugin_id>");
-                        } else if let Ok(id) = parts[2].parse::<u32>() {
-                            // The editor thread uses the plugin, so close its window first.
-                            // The editor window uses the plugin, so close it first.
-                            close_editor_window(id);
-                            if spaph_audio::active_ids().contains(&id) {
-                                let _ = spaph_audio::disarm(id);
-                                manager().lock().unwrap().clear_audio_device(id);
-                            }
-                            let mut mgr = manager().lock().unwrap();
-                            mgr.clear_audio_device(id);
-                            match mgr.unload(id) {
-                                Ok(_) => println!("unloaded {}", id),
+                            cmd_err!("usage: plugin unload <plugin_id|all>");
+                        } else if parts[2] == "all" {
+                            unload_all_plugins();
+                        } else if let Some(id) = resolve_plugin_arg(&parts[2]) {
+                            match unload_plugin(id) {
+                                Ok(()) => println!("unloaded {}", id),
                                 Err(e) => cmd_err!("error: {}", e),
                             }
                         } else {
-                            cmd_err!("invalid plugin id");
+                            cmd_err!("invalid plugin id or alias");
                         }
                     }
                     "show" => {
                         if parts.len() < 3 {
                             cmd_err!("usage: plugin show <plugin_id>");
-                        } else if let Ok(pid) = parts[2].parse::<u32>() {
+                        } else if let Some(pid) = resolve_plugin_arg(&parts[2]) {
                             match open_editor_window(pid) {
                                 Ok(()) => println!("editor opened for plugin {} (plugin hide {} closes it)", pid, pid),
                                 Err(e) => cmd_err!("error: {}", e),
                             }
                         } else {
-                            cmd_err!("invalid plugin id");
+                            cmd_err!("invalid plugin id or alias");
                         }
                     }
                     "hide" => {
                         if parts.len() < 3 {
                             cmd_err!("usage: plugin hide <plugin_id>");
-                        } else if let Ok(pid) = parts[2].parse::<u32>() {
+                        } else if let Some(pid) = resolve_plugin_arg(&parts[2]) {
                             if close_editor_window(pid) {
                                 println!("editor closed for plugin {}", pid);
                             } else if manager().lock().unwrap().get_instance(pid).is_some() {
@@ -784,7 +833,7 @@ fn run_line(line: &str) -> bool {
                                 cmd_err!("plugin {} not found", pid);
                             }
                         } else {
-                            cmd_err!("invalid plugin id");
+                            cmd_err!("invalid plugin id or alias");
                         }
                     }
                     "preset" => {
@@ -795,7 +844,7 @@ fn run_line(line: &str) -> bool {
                                 "list" => {
                                     if parts.len() < 4 {
                                         cmd_err!("usage: plugin preset list <plugin_id>");
-                                    } else if let Ok(pid) = parts[3].parse::<u32>() {
+                                    } else if let Some(pid) = resolve_plugin_arg(&parts[3]) {
                                         let mgr = manager().lock().unwrap();
                                         match mgr.list_presets(pid) {
                                             Ok(ps) => {
@@ -810,7 +859,7 @@ fn run_line(line: &str) -> bool {
                                             Err(e) => cmd_err!("error: {}", e),
                                         }
                                     } else {
-                                        cmd_err!("invalid plugin id");
+                                        cmd_err!("invalid plugin id or alias");
                                     }
                                 }
                                 "select" => {
@@ -818,7 +867,7 @@ fn run_line(line: &str) -> bool {
                                     // rebuild a pseudo-parts for parse_select_args compatibility is awkward; parse directly:
                                     if parts.len() < 5 {
                                         cmd_err!("usage: plugin preset select <plugin_id> <preset_id>");
-                                    } else if let (Ok(pid), Ok(preset)) = (parts[3].parse::<u32>(), parts[4].parse::<u32>()) {
+                                    } else if let (Some(pid), Ok(preset)) = (resolve_plugin_arg(&parts[3]), parts[4].parse::<u32>()) {
                                         if preset == 0 {
                                             cmd_err!("preset id must be >= 1");
                                         } else {
@@ -846,7 +895,7 @@ fn run_line(line: &str) -> bool {
                                 "load" => {
                                     if parts.len() < 5 {
                                         cmd_err!("usage: plugin preset load <plugin_id> <file>");
-                                    } else if let Ok(pid) = parts[3].parse::<u32>() {
+                                    } else if let Some(pid) = resolve_plugin_arg(&parts[3]) {
                                         let file = PathBuf::from(&parts[4]);
                                         let mgr = manager().lock().unwrap();
                                         let inst = mgr.get_instance(pid);
@@ -861,13 +910,13 @@ fn run_line(line: &str) -> bool {
                                             cmd_err!("plugin {} not found", pid);
                                         }
                                     } else {
-                                        cmd_err!("invalid plugin id");
+                                        cmd_err!("invalid plugin id or alias");
                                     }
                                 }
                                 "save" => {
                                     if parts.len() < 5 {
                                         cmd_err!("usage: plugin preset save <plugin_id> <file>");
-                                    } else if let Ok(pid) = parts[3].parse::<u32>() {
+                                    } else if let Some(pid) = resolve_plugin_arg(&parts[3]) {
                                         let file = PathBuf::from(&parts[4]);
                                         let mgr = manager().lock().unwrap();
                                         let inst = mgr.get_instance(pid);
@@ -882,7 +931,7 @@ fn run_line(line: &str) -> bool {
                                             cmd_err!("plugin {} not found", pid);
                                         }
                                     } else {
-                                        cmd_err!("invalid plugin id");
+                                        cmd_err!("invalid plugin id or alias");
                                     }
                                 }
                                 other => cmd_err!("unknown preset action: {}", other),
@@ -897,7 +946,7 @@ fn run_line(line: &str) -> bool {
                                 "list" => {
                                     if parts.len() < 4 {
                                         cmd_err!("usage: plugin param list <plugin_id>");
-                                    } else if let Ok(pid) = parts[3].parse::<u32>() {
+                                    } else if let Some(pid) = resolve_plugin_arg(&parts[3]) {
                                         let mgr = manager().lock().unwrap();
                                         let inst = mgr.get_instance(pid);
                                         drop(mgr);
@@ -912,13 +961,13 @@ fn run_line(line: &str) -> bool {
                                             cmd_err!("plugin {} not found", pid);
                                         }
                                     } else {
-                                        cmd_err!("invalid plugin id");
+                                        cmd_err!("invalid plugin id or alias");
                                     }
                                 }
                                 "get" => {
                                     if parts.len() < 5 {
                                         cmd_err!("usage: plugin param get <plugin_id> <index>");
-                                    } else if let (Ok(pid), Ok(idx)) = (parts[3].parse::<u32>(), parts[4].parse::<u32>()) {
+                                    } else if let (Some(pid), Ok(idx)) = (resolve_plugin_arg(&parts[3]), parts[4].parse::<u32>()) {
                                         let mgr = manager().lock().unwrap();
                                         let inst = mgr.get_instance(pid);
                                         drop(mgr);
@@ -936,7 +985,7 @@ fn run_line(line: &str) -> bool {
                                 "set" => {
                                     if parts.len() < 6 {
                                         cmd_err!("usage: plugin param set <plugin_id> <index|volume> <value>");
-                                    } else if let (Ok(pid), Ok(val)) = (parts[3].parse::<u32>(), parts[5].parse::<f32>()) {
+                                    } else if let (Some(pid), Ok(val)) = (resolve_plugin_arg(&parts[3]), parts[5].parse::<f32>()) {
                                         if parts[4] == "volume" {
                                             let mgr = manager().lock().unwrap();
                                             match mgr.set_gain(pid, val) {
@@ -1000,8 +1049,8 @@ fn run_line(line: &str) -> bool {
                             // if parse failed, ch is None but we already errored; skip
                             if parts.len() >= 4 && ch.is_none() {
                                 // error already reported
-                            } else if IN_SCRIPT.load(Ordering::Relaxed) {
-                                eprintln!("warning: 'midi listen' is interactive only; skipped in script");
+                            } else if IN_SCRIPT.load(Ordering::Relaxed) || IN_OSC.load(Ordering::Relaxed) {
+                                eprintln!("warning: 'midi listen' is interactive only; skipped in script or over OSC");
                             } else {
                                 midi_listen(&parts[2], ch);
                             }
@@ -1010,7 +1059,7 @@ fn run_line(line: &str) -> bool {
                     "connect" => {
                         if parts.len() < 4 {
                             cmd_err!("usage: midi connect <port> <plugin_id> [midi_channel]");
-                        } else if let Ok(pid) = parts[3].parse::<u32>() {
+                        } else if let Some(pid) = resolve_plugin_arg(&parts[3]) {
                             let ch = if parts.len() >= 5 {
                                 match parse_midi_channel(&parts[4]) {
                                     Ok(c) => Some(c),
@@ -1026,7 +1075,7 @@ fn run_line(line: &str) -> bool {
                                 midi_connect(parts[2].clone(), pid, ch);
                             }
                         } else {
-                            cmd_err!("invalid plugin id");
+                            cmd_err!("invalid plugin id or alias");
                         }
                     }
                     "stats" => {
@@ -1055,9 +1104,9 @@ fn run_line(line: &str) -> bool {
                         } else if parts.len() == 4 {
                             // midi disconnect <port> <id>
                             let port = &parts[2];
-                            let pid: u32 = match parts[3].parse() {
-                                Ok(v) => v,
-                                Err(_) => { cmd_err!("invalid plugin id"); return true; }
+                            let pid: u32 = match resolve_plugin_arg(&parts[3]) {
+                                Some(v) => v,
+                                None => { cmd_err!("invalid plugin id or alias"); return true; }
                             };
                             match disconnect_midi_filtered(Some(port), Some(pid), None) {
                                 Ok(_) => println!("midi disconnected"),
@@ -1066,9 +1115,9 @@ fn run_line(line: &str) -> bool {
                         } else if parts.len() == 5 {
                             // midi disconnect <port> <id> <channel>
                             let port = &parts[2];
-                            let pid: u32 = match parts[3].parse() {
-                                Ok(v) => v,
-                                Err(_) => { cmd_err!("invalid plugin id"); return true; }
+                            let pid: u32 = match resolve_plugin_arg(&parts[3]) {
+                                Some(v) => v,
+                                None => { cmd_err!("invalid plugin id or alias"); return true; }
                             };
                             let ch = match parse_midi_channel(&parts[4]) {
                                 Ok(c) => c,
@@ -1105,7 +1154,7 @@ fn run_line(line: &str) -> bool {
                     "connect" => {
                         if parts.len() < 3 {
                             cmd_err!("usage: audio connect <plugin_id> [device_index]");
-                        } else if let Ok(pid) = parts[2].parse::<u32>() {
+                        } else if let Some(pid) = resolve_plugin_arg(&parts[2]) {
                             let dev_idx = parts.get(3).and_then(|s| s.parse::<usize>().ok());
                             let mgr = manager().lock().unwrap();
                             let inst = mgr.get_instance(pid);
@@ -1136,11 +1185,11 @@ fn run_line(line: &str) -> bool {
                                 _ => cmd_err!("plugin {} not found", pid),
                             }
                         } else {
-                            cmd_err!("invalid plugin id");
+                            cmd_err!("invalid plugin id or alias");
                         }
                     }
                     "disconnect" => {
-                        let pid = parts.get(2).and_then(|s| s.parse::<u32>().ok());
+                        let pid = parts.get(2).and_then(|s| resolve_plugin_arg(s));
                         let dev = parts.get(3).map(|s| s.as_str());
                         match disconnect_audio(pid, dev) {
                             Ok(_) => println!("audio disconnected"),
@@ -1169,7 +1218,7 @@ fn run_line(line: &str) -> bool {
                     cmd_err!("usage: volume [<plugin_id>] <level>");
                 }
             } else if parts.len() == 3 {
-                if let (Ok(pid), Ok(level)) = (parts[1].parse::<u32>(), parts[2].parse::<f32>()) {
+                if let (Some(pid), Ok(level)) = (resolve_plugin_arg(&parts[1]), parts[2].parse::<f32>()) {
                     let mgr = manager().lock().unwrap();
                     match mgr.set_gain(pid, level) {
                         Ok(_) => println!("volume set to {} for plugin {}", level, pid),
@@ -1209,6 +1258,29 @@ fn run_line(line: &str) -> bool {
                 cmd_err!("usage: backend list");
             }
         }
+        "load" => {
+            if parts.len() < 2 {
+                cmd_err!("usage: load <script>");
+            } else if LOAD_DEPTH.load(Ordering::Relaxed) >= MAX_LOAD_DEPTH {
+                cmd_err!("load: scripts nested too deep (max {})", MAX_LOAD_DEPTH);
+            } else {
+                let base = CONFIG_DIR.get().and_then(|d| d.as_deref());
+                let cfg = spaph_config::Config { script: Some(PathBuf::from(&parts[1])), ..Default::default() };
+                match spaph_config::resolve_script(&cfg, base) {
+                    Some(path) => {
+                        LOAD_DEPTH.fetch_add(1, Ordering::Relaxed);
+                        let result = run_script(&path);
+                        LOAD_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                        // A failing line in the loaded script is an error of this command too,
+                        // so the calling script stops as well.
+                        if let Err(msg) = result {
+                            cmd_err!("load {}: {}", parts[1], msg);
+                        }
+                    }
+                    None => cmd_err!("usage: load <script>"),
+                }
+            }
+        }
         "quit" | "exit" => {
             return false;
         }
@@ -1234,13 +1306,43 @@ fn wait_for_ack(ack_rx: &std::sync::mpsc::Receiver<()>, stop: &std::sync::atomic
     }
 }
 
+/// A command waiting for the console thread: typed at the prompt, or received over OSC.
+struct ConsoleMsg {
+    text: String,
+    from_osc: bool,
+}
+
+/// True if `line` would end the program (`quit` / `exit` as its first word).
+fn is_quit_command(line: &str) -> bool {
+    matches!(split_args(line).first().map(String::as_str), Some("quit") | Some("exit"))
+}
+
+/// Run a command received over OSC. It runs on the console thread like a typed command, but
+/// is non-interactive (see `IN_OSC`), and it cannot end the program.
+fn run_osc_line(line: &str) {
+    if is_quit_command(line) {
+        eprintln!("warning: 'quit' is ignored over OSC");
+        return;
+    }
+    IN_OSC.store(true, Ordering::Relaxed);
+    let _ = run_line(line);
+    IN_OSC.store(false, Ordering::Relaxed);
+}
+
 fn run_shell(osc_port: u16) {
     // Start OSC server
     let bind = format!("0.0.0.0:{}", osc_port);
     let stop = osc_stop();
     stop.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Console lines and OSC commands both end up on the console thread through this channel:
+    // that thread owns the editor windows, so `plugin show/hide/unload` work from OSC too.
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<ConsoleMsg>();
+    let osc_tx = msg_tx.clone();
     let handle = std::thread::spawn(move || {
-        if let Err(e) = spaph_osc::run_server(&bind, |cmd| { let _ = run_line(&cmd); }, stop.clone()) {
+        let on_command = move |cmd: String| {
+            let _ = osc_tx.send(ConsoleMsg { text: cmd, from_osc: true });
+        };
+        if let Err(e) = spaph_osc::run_server(&bind, on_command, stop.clone()) {
             eprintln!("OSC server error: {}", e);
         }
     });
@@ -1251,7 +1353,6 @@ fn run_shell(osc_port: u16) {
     save_terminal();
 
     // Readline in a background thread so the main thread is free for the audio stream.
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
     // Acknowledgements from the main thread: a new prompt is shown only after the previous
     // command has finished, so command output never interleaves with the prompt.
     let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
@@ -1272,18 +1373,21 @@ fn run_shell(osc_port: u16) {
             match rl.readline("spaph> ") {
                 Ok(line) => {
                     let _ = rl.add_history_entry(line.as_str());
-                    if line_tx.send(line.trim().to_string()).is_err() {
+                    let msg = ConsoleMsg { text: line.trim().to_string(), from_osc: false };
+                    if msg_tx.send(msg).is_err() {
                         break;
                     }
                 }
                 Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                    let _ = line_tx.send("quit".to_string());
+                    let _ = msg_tx.send(ConsoleMsg { text: "quit".to_string(), from_osc: false });
                     break;
                 }
                 Err(e) => {
                     if !stdin_stop().load(std::sync::atomic::Ordering::Relaxed) {
                         eprintln!("readline error: {}", e);
                     }
+                    // The OSC thread also holds a sender, so end the console loop explicitly.
+                    let _ = msg_tx.send(ConsoleMsg { text: "quit".to_string(), from_osc: false });
                     break;
                 }
             }
@@ -1299,9 +1403,10 @@ fn run_shell(osc_port: u16) {
     // Wait for commands, but wake up regularly to service open editor windows. The prompt
     // itself runs on its own thread, so this loop never blocks the console.
     loop {
-        match line_rx.recv_timeout(EDITOR_FRAME) {
-            Ok(line) => {
-                if !run_line(&line) {
+        match msg_rx.recv_timeout(EDITOR_FRAME) {
+            Ok(msg) if msg.from_osc => run_osc_line(&msg.text),
+            Ok(msg) => {
+                if !run_line(&msg.text) {
                     break;
                 }
                 let _ = ack_tx.send(());
@@ -1362,7 +1467,7 @@ fn init_logging(level: &str) {
 fn run_script(path: &Path) -> std::result::Result<(), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read script {}: {}", path.display(), e))?;
-    IN_SCRIPT.store(true, Ordering::Relaxed);
+    let was_in_script = IN_SCRIPT.swap(true, Ordering::Relaxed);
     let mut result = Ok(());
     for ScriptLine { line, command } in spaph_config::parse_script(&text) {
         CMD_ERROR.store(false, Ordering::Relaxed);
@@ -1380,7 +1485,8 @@ fn run_script(path: &Path) -> std::result::Result<(), String> {
             break;
         }
     }
-    IN_SCRIPT.store(false, Ordering::Relaxed);
+    // Restore rather than clear: a nested `load` runs inside an outer script.
+    IN_SCRIPT.store(was_in_script, Ordering::Relaxed);
     result
 }
 
@@ -1388,6 +1494,7 @@ fn main() {
     let _ = CONSOLE_THREAD.set(std::thread::current().id());
     let cli = Cli::parse();
     let (config_path, mut cfg) = load_startup_config(&cli);
+    let _ = CONFIG_DIR.set(config_path.as_deref().and_then(|p| p.parent()).map(Path::to_path_buf));
 
     let overrides = Overrides {
         sample_rate: cli.sample_rate,
@@ -1436,7 +1543,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{midi_channel_of, midi_matches, parse_midi_channel, split_args};
+    use super::{is_quit_command, midi_channel_of, midi_matches, parse_midi_channel, split_args};
+
+    #[test]
+    fn quit_detected_as_first_word() {
+        assert!(is_quit_command("quit"));
+        assert!(is_quit_command("  exit  "));
+        assert!(is_quit_command("quit now"));
+    }
+
+    #[test]
+    fn other_commands_are_not_quit() {
+        assert!(!is_quit_command("master 0.5"));
+        assert!(!is_quit_command("load quit.spaph"));
+        assert!(!is_quit_command(""));
+    }
 
     #[test]
     fn split_simple() {

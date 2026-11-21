@@ -1760,6 +1760,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "rosc",
  "rustyline",
  "serde",
  "serde_json",
