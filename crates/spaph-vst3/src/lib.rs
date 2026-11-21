@@ -6,6 +6,23 @@ use std::path::Path;
 use vst3_host::plugin::Plugin as Vst3Plugin;
 use vst3_host::simple;
 
+/// Channel count of the main bus: the first active bus with channels. `None` if there is none.
+pub fn main_bus_channels(buses: &[vst3_host::audio::AudioBusConfig]) -> Option<u32> {
+    buses
+        .iter()
+        .find(|b| b.active && b.channel_count > 0)
+        .map(|b| b.channel_count as u32)
+}
+
+/// Smallest input value handed to a VST3 plugin: about -180 dBFS, inaudible.
+pub const SILENCE_FLOOR: f32 = 1e-9;
+
+/// Replace an exact zero with `SILENCE_FLOOR`. The host flags an all-zero bus as silent, and
+/// some effects then stop producing their tail (reverb, delay), so exact silence is avoided.
+pub fn keep_active(s: f32) -> f32 {
+    if s == 0.0 { SILENCE_FLOOR } else { s }
+}
+
 pub struct Vst3Factory;
 
 impl PluginFactory for Vst3Factory {
@@ -22,6 +39,15 @@ impl PluginFactory for Vst3Factory {
     fn load(&self, path: &Path) -> Result<Box<dyn SpaphPluginInstance>> {
         let plugin = simple::load_plugin(path).map_err(|e| SpaphError::Plugin(e.to_string()))?;
         let vi = plugin.info().clone();
+        // `vi.audio_inputs` / `audio_outputs` count buses, not channels. Use the channel count
+        // of the main (first active) bus instead, falling back to the bus counts.
+        let (num_inputs, num_outputs) = match plugin.audio_bus_layout() {
+            Ok(layout) => (
+                main_bus_channels(&layout.inputs).unwrap_or(0),
+                main_bus_channels(&layout.outputs).unwrap_or(0),
+            ),
+            Err(_) => (vi.audio_inputs, vi.audio_outputs),
+        };
         let params = plugin.get_parameters().map_err(|e| SpaphError::Plugin(e.to_string()))?;
         let param_infos: Vec<ParamInfo> = params
             .iter()
@@ -55,8 +81,8 @@ impl PluginFactory for Vst3Factory {
             vendor: vi.vendor.clone(),
             version: vi.version.clone(),
             format: PluginFormat::Vst3,
-            num_inputs: vi.audio_inputs,
-            num_outputs: vi.audio_outputs,
+            num_inputs,
+            num_outputs,
             params: param_infos,
             presets: preset_names,
         };
@@ -129,11 +155,15 @@ impl SpaphPluginInstance for Vst3Instance {
     }
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], num_frames: usize) {
         let mut bufs = vst3_host::audio::AudioBuffers::new(inputs.len(), outputs.len(), num_frames, self.sample_rate);
-        for (i, ch) in inputs.iter().enumerate() {
-            if i < bufs.inputs.len() {
-                for (j, s) in ch.iter().enumerate().take(num_frames) {
-                    bufs.inputs[i][j] = *s;
+        for (i, ch) in bufs.inputs.iter_mut().enumerate() {
+            match inputs.get(i) {
+                Some(src) => {
+                    for (j, s) in src.iter().enumerate().take(num_frames) {
+                        ch[j] = keep_active(*s);
+                    }
                 }
+                // Unconnected input channels are fed the floor too, so no bus is flagged silent.
+                None => ch.fill(SILENCE_FLOOR),
             }
         }
         let _ = self.plugin.lock().unwrap().process_audio(&mut bufs);
@@ -196,5 +226,48 @@ impl SpaphPluginInstance for Vst3Instance {
     }
     fn load_state(&mut self, data: &[u8]) -> Result<()> {
         self.plugin.lock().unwrap().load_state(data).map_err(|e| SpaphError::Plugin(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{main_bus_channels, keep_active, SILENCE_FLOOR};
+
+    #[test]
+    fn zero_input_sample_becomes_inaudible_floor() {
+        // A bus of exact zeros is flagged silent by the VST3 host, and effects such as Calf
+        // reverb then stop their tail. The floor is -180 dBFS: inaudible, but not zero.
+        assert_ne!(keep_active(0.0), 0.0);
+        assert_eq!(keep_active(0.0), SILENCE_FLOOR);
+        assert!(SILENCE_FLOOR < 1e-8 && SILENCE_FLOOR > 1e-12);
+    }
+
+    #[test]
+    fn non_zero_input_sample_is_unchanged() {
+        assert_eq!(keep_active(0.25), 0.25);
+        assert_eq!(keep_active(-0.5), -0.5);
+    }
+
+    use vst3_host::audio::AudioBusConfig;
+
+    fn bus(channel_count: usize, active: bool) -> AudioBusConfig {
+        AudioBusConfig { channel_count, active }
+    }
+
+    #[test]
+    fn main_bus_channels_counts_channels_not_buses() {
+        assert_eq!(main_bus_channels(&[bus(2, true), bus(2, true)]), Some(2));
+    }
+
+    #[test]
+    fn main_bus_channels_skips_inactive_buses() {
+        assert_eq!(main_bus_channels(&[bus(2, false), bus(1, true)]), Some(1));
+    }
+
+    #[test]
+    fn main_bus_channels_none_without_active_bus() {
+        assert_eq!(main_bus_channels(&[]), None);
+        assert_eq!(main_bus_channels(&[bus(2, false)]), None);
+        assert_eq!(main_bus_channels(&[bus(0, true)]), None);
     }
 }

@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub struct PluginSummary {
     pub id: u32,
     pub alias: Option<String>,
+    /// Plugin whose output feeds this plugin's input (`plugin connect`), if any.
+    pub input_from: Option<u32>,
     pub name: String,
     pub vendor: String,
     pub format: PluginFormat,
@@ -41,6 +43,8 @@ pub fn validate_alias(alias: &str) -> Result<()> {
 pub struct LoadedPlugin {
     pub id: u32,
     pub alias: Option<String>,
+    /// Source plugin feeding this plugin's audio input. Explicit only (`plugin connect`).
+    pub input_from: Option<u32>,
     pub path: PathBuf,
     pub info: SpaphPluginInfo,
     pub instance: std::sync::Arc<std::sync::Mutex<Box<dyn PluginInstance>>>,
@@ -101,6 +105,7 @@ impl PluginManager {
         self.plugins.push(LoadedPlugin {
             id,
             alias: alias.map(str::to_string),
+            input_from: None,
             path: path.to_path_buf(),
             info,
             instance: std::sync::Arc::new(std::sync::Mutex::new(instance)),
@@ -119,7 +124,74 @@ impl PluginManager {
             .position(|p| p.id == id)
             .ok_or_else(|| SpaphError::Plugin(format!("no plugin with id {}", id)))?;
         self.plugins.remove(pos);
+        // Links that used this plugin as a source now have no input.
+        for p in self.plugins.iter_mut() {
+            if p.input_from == Some(id) {
+                p.input_from = None;
+            }
+        }
         Ok(())
+    }
+
+    fn position_of(&self, id: u32) -> Option<usize> {
+        self.plugins.iter().position(|p| p.id == id)
+    }
+
+    /// Make `source`'s output the audio input of `target`. Replaces any previous source of
+    /// `target`. Fan-out (one source, several targets) is allowed. Nothing changes on error.
+    pub fn connect(&mut self, source: u32, target: u32) -> Result<()> {
+        if self.position_of(source).is_none() {
+            return Err(SpaphError::Plugin(format!("no plugin with id {}", source)));
+        }
+        let dst = self.position_of(target)
+            .ok_or_else(|| SpaphError::Plugin(format!("no plugin with id {}", target)))?;
+        if source == target {
+            return Err(SpaphError::Plugin(format!("plugin {} cannot feed itself", source)));
+        }
+        if self.plugins[dst].info.num_inputs == 0 {
+            return Err(SpaphError::Plugin(format!("plugin {} has no audio inputs", target)));
+        }
+        // Walk upstream from the source: a link makes `target` a source of itself if the chain
+        // already reaches it. Each plugin has one source, so the walk is a simple list.
+        let mut cur = Some(source);
+        let mut steps = 0;
+        while let Some(id) = cur {
+            if id == target {
+                return Err(SpaphError::Plugin(format!(
+                    "connecting {} to {} would create a cycle", source, target
+                )));
+            }
+            steps += 1;
+            if steps > self.plugins.len() {
+                break;
+            }
+            cur = self.plugins[self.position_of(id).unwrap()].input_from;
+        }
+        self.plugins[dst].input_from = Some(source);
+        Ok(())
+    }
+
+    /// Remove the audio input link of `target`.
+    pub fn disconnect(&mut self, target: u32) -> Result<()> {
+        let dst = self.position_of(target)
+            .ok_or_else(|| SpaphError::Plugin(format!("no plugin with id {}", target)))?;
+        if self.plugins[dst].input_from.take().is_none() {
+            return Err(SpaphError::Plugin(format!("plugin {} has no input connection", target)));
+        }
+        Ok(())
+    }
+
+    /// The source feeding `id`, if any.
+    pub fn input_source(&self, id: u32) -> Option<u32> {
+        self.position_of(id).and_then(|i| self.plugins[i].input_from)
+    }
+
+    /// All links as `(target, source)` pairs.
+    pub fn links(&self) -> Vec<(u32, u32)> {
+        self.plugins
+            .iter()
+            .filter_map(|p| p.input_from.map(|s| (p.id, s)))
+            .collect()
     }
 
     /// Resolve a command argument to a plugin id. A numeric token is the id itself; anything
@@ -137,6 +209,7 @@ impl PluginManager {
             .map(|p| PluginSummary {
                 id: p.id,
                 alias: p.alias.clone(),
+                input_from: p.input_from,
                 name: p.info.name.clone(),
                 vendor: p.info.vendor.clone(),
                 format: p.info.format,
@@ -341,6 +414,7 @@ mod tests {
         mgr.plugins.push(LoadedPlugin {
             id,
             alias: None,
+            input_from: None,
             path: PathBuf::from("/mock"),
             info: mock_info(),
             instance: std::sync::Arc::new(std::sync::Mutex::new(Box::new(MockPlugin { info: mock_info() }))),
@@ -464,6 +538,143 @@ mod tests {
         let err = mgr.load_as(Path::new("/no/such.vst3"), Some("synth")).unwrap_err();
         assert!(err.to_string().contains("already in use"), "{err}");
         assert_eq!(mgr.resolve("synth"), Some(id));
+    }
+
+    fn insert_mock_inputs(mgr: &mut PluginManager, inputs: u32) -> u32 {
+        let id = insert_mock(mgr);
+        mgr.plugins.last_mut().unwrap().info.num_inputs = inputs;
+        id
+    }
+
+    #[test]
+    fn connect_sets_input_source() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        mgr.connect(a, b).unwrap();
+        assert_eq!(mgr.input_source(b), Some(a));
+        assert_eq!(mgr.links(), vec![(b, a)]);
+    }
+
+    #[test]
+    fn connect_rejects_self_link() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        assert!(mgr.connect(a, a).is_err());
+        assert!(mgr.links().is_empty());
+    }
+
+    #[test]
+    fn connect_rejects_unknown_plugins() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        assert!(mgr.connect(999, a).unwrap_err().to_string().contains("no plugin with id 999"));
+        assert!(mgr.connect(a, 999).is_err());
+        assert!(mgr.links().is_empty());
+    }
+
+    #[test]
+    fn connect_rejects_target_without_audio_inputs() {
+        let mut mgr = PluginManager::new();
+        let synth = insert_mock(&mut mgr);
+        let instrument = insert_mock_inputs(&mut mgr, 0);
+        let err = mgr.connect(synth, instrument).unwrap_err().to_string();
+        assert!(err.contains("has no audio inputs"), "{err}");
+        assert!(mgr.links().is_empty());
+    }
+
+    #[test]
+    fn connect_rejects_cycle_without_changing_state() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        let c = insert_mock(&mut mgr);
+        mgr.connect(a, b).unwrap();
+        mgr.connect(b, c).unwrap();
+        let err = mgr.connect(c, a).unwrap_err().to_string();
+        assert!(err.contains("would create a cycle"), "{err}");
+        assert_eq!(mgr.links(), vec![(b, a), (c, b)]);
+    }
+
+    #[test]
+    fn fan_out_is_allowed() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        let c = insert_mock(&mut mgr);
+        mgr.connect(a, b).unwrap();
+        mgr.connect(a, c).unwrap();
+        assert_eq!(mgr.input_source(b), Some(a));
+        assert_eq!(mgr.input_source(c), Some(a));
+    }
+
+    #[test]
+    fn connect_replaces_existing_source() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        let c = insert_mock(&mut mgr);
+        mgr.connect(a, b).unwrap();
+        mgr.connect(c, b).unwrap();
+        assert_eq!(mgr.input_source(b), Some(c));
+        assert_eq!(mgr.links(), vec![(b, c)]);
+    }
+
+    #[test]
+    fn disconnect_removes_link() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        mgr.connect(a, b).unwrap();
+        mgr.disconnect(b).unwrap();
+        assert_eq!(mgr.input_source(b), None);
+        assert!(mgr.links().is_empty());
+    }
+
+    #[test]
+    fn disconnect_unlinked_plugin_errors() {
+        let mut mgr = PluginManager::new();
+        let b = insert_mock(&mut mgr);
+        let err = mgr.disconnect(b).unwrap_err().to_string();
+        assert!(err.contains("has no input connection"), "{err}");
+    }
+
+    #[test]
+    fn disconnect_unknown_plugin_errors() {
+        let mut mgr = PluginManager::new();
+        assert!(mgr.disconnect(999).is_err());
+    }
+
+    #[test]
+    fn unload_of_source_clears_downstream_link() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        mgr.connect(a, b).unwrap();
+        mgr.unload(a).unwrap();
+        assert_eq!(mgr.input_source(b), None);
+        assert!(mgr.links().is_empty());
+    }
+
+    #[test]
+    fn unload_of_target_removes_its_link() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        mgr.connect(a, b).unwrap();
+        mgr.unload(b).unwrap();
+        assert!(mgr.links().is_empty());
+    }
+
+    #[test]
+    fn list_reports_input_source() {
+        let mut mgr = PluginManager::new();
+        let a = insert_mock(&mut mgr);
+        let b = insert_mock(&mut mgr);
+        mgr.connect(a, b).unwrap();
+        let list = mgr.list();
+        assert_eq!(list[0].input_from, None);
+        assert_eq!(list[1].input_from, Some(a));
     }
 
     #[test]

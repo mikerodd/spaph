@@ -516,3 +516,40 @@ fn numeric_id_still_reports_not_found_not_alias_error() {
     assert_eq!(code, Some(1));
     assert!(err.contains("plugin 99 not found"), "{err}");
 }
+
+#[test]
+fn plugin_connect_without_both_ids_prints_usage() {
+    let (code, _, err) = run_script_text("connu", "plugin connect 1\n");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("usage: plugin connect <source> <target>"), "{err}");
+}
+
+#[test]
+fn plugin_connect_unknown_numeric_ids_report_not_found() {
+    let (code, _, err) = run_script_text("connnf", "plugin connect 1 2\n");
+    assert_eq!(code, Some(1));
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(err.contains("no plugin with id 1"), "{err}");
+}
+
+#[test]
+fn plugin_connect_unknown_alias_reports_invalid() {
+    let (code, _, err) = run_script_text("connal", "plugin connect nosuch other\n");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("invalid plugin id or alias"), "{err}");
+}
+
+#[test]
+fn plugin_disconnect_unknown_reports_not_found() {
+    let (code, _, err) = run_script_text("discnf", "plugin disconnect 99\n");
+    assert_eq!(code, Some(1));
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(err.contains("no plugin with id 99"), "{err}");
+}
+
+#[test]
+fn plugin_disconnect_without_id_prints_usage() {
+    let (code, _, err) = run_script_text("discu", "plugin disconnect\n");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("usage: plugin disconnect <target>"), "{err}");
+}

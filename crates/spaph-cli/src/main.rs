@@ -161,6 +161,8 @@ fn print_help() {
     println!("  plugin unload <id|all>        Unload a plugin by id or alias, or all plugins (also disconnects MIDI and audio)");
     println!("  plugin show <id>              Open plugin editor window (VST2 and VST3); prompt stays usable");
     println!("  plugin hide <id>              Close plugin editor window");
+    println!("  plugin connect <src> <dst>    Feed plugin <src>'s output into plugin <dst>'s audio input");
+    println!("  plugin disconnect <dst>       Remove the audio input link of plugin <dst>");
     println!("  plugin preset list <id>       List presets of a plugin");
     println!("  plugin preset select <id> <n> Select a preset (1-based)");
     println!("  plugin preset scan <dir>      Scan a directory for preset files");
@@ -457,15 +459,51 @@ fn disconnect_midi_filtered(
 fn unload_plugin(id: u32) -> std::result::Result<(), String> {
     // The editor window uses the plugin, so close it first.
     close_editor_window(id);
-    if spaph_audio::active_ids().contains(&id) {
-        let _ = spaph_audio::disarm(id);
-    }
     // MIDI threads keep feeding the plugin's queue until stopped; "no matching connection"
     // just means this plugin had no MIDI input.
     let _ = disconnect_midi_filtered(None, Some(id), None);
-    let mut mgr = manager().lock().unwrap();
-    mgr.clear_audio_device(id);
-    mgr.unload(id).map_err(|e| e.to_string())
+    {
+        let mut mgr = manager().lock().unwrap();
+        mgr.clear_audio_device(id);
+        // Unloading also removes links where this plugin was a source.
+        mgr.unload(id).map_err(|e| e.to_string())?;
+    }
+    spaph_audio::detach(id);
+    sync_links();
+    Ok(())
+}
+
+/// Push the current plugin links to the audio graph.
+fn sync_links() {
+    let links = manager().lock().unwrap().links();
+    spaph_audio::set_links(&links);
+}
+
+/// Add plugin `id` to the audio graph without mixing it to the output (it only feeds others).
+fn attach_to_graph(id: u32) {
+    let handles = {
+        let mgr = manager().lock().unwrap();
+        (mgr.get_instance(id), mgr.get_gain_handle(id), mgr.get_midi_queue(id))
+    };
+    if let (Some(inst), Some(gain), Some(queue)) = handles {
+        let _ = spaph_audio::attach(id, inst, gain, queue, false);
+    }
+}
+
+/// `plugin connect <src> <dst>`: validate in the manager, then add both ends to the graph.
+fn connect_plugins(src: u32, dst: u32) -> std::result::Result<(), String> {
+    manager().lock().unwrap().connect(src, dst).map_err(|e| e.to_string())?;
+    attach_to_graph(src);
+    attach_to_graph(dst);
+    sync_links();
+    Ok(())
+}
+
+/// `plugin disconnect <dst>`: remove the input link of `dst`.
+fn disconnect_plugin(dst: u32) -> std::result::Result<(), String> {
+    manager().lock().unwrap().disconnect(dst).map_err(|e| e.to_string())?;
+    sync_links();
+    Ok(())
 }
 
 /// `plugin unload all`: unload every plugin, reporting each failure.
@@ -487,7 +525,8 @@ fn unload_all_plugins() {
 
 fn disconnect_all_audio() {
     let armed = spaph_audio::active_ids();
-    spaph_audio::disarm_all();
+    // Stop mixing to the device; plugins that are part of a link keep processing.
+    spaph_audio::unmix_all();
     for id in &armed {
         manager().lock().unwrap().clear_audio_device(*id);
     }
@@ -713,6 +752,8 @@ fn shutdown(code: i32) -> ! {
     let finished = spaph_core::run_with_timeout(
         || {
             cleanup_connections();
+            // Full stop: also drops plugins that were kept only for their links.
+            spaph_audio::disarm_all();
             // Stop the output stream before the process exits. With ASIO the driver keeps its
             // callback running until the stream is dropped, which can block at exit.
             tracing::debug!("shutdown: stopping output stream");
@@ -745,7 +786,7 @@ fn run_line(line: &str) -> bool {
         "help" => print_help(),
         "plugin" => {
             if parts.len() < 2 {
-                cmd_err!("usage: plugin <load|list|unload|show|hide|preset|param|volume> ...");
+                cmd_err!("usage: plugin <load|list|unload|show|hide|connect|disconnect|preset|param|volume> ...");
             } else {
                 match parts[1].as_str() {
                     "load" => {
@@ -791,8 +832,36 @@ fn run_line(line: &str) -> bool {
                                     "no".to_string()
                                 };
                                 let alias_str = p.alias.as_ref().map(|a| format!(" as {}", a)).unwrap_or_default();
-                                println!("  #{}{} {} ({:?}) - {} params | midi: {} | audio: {}", p.id, alias_str, p.name, p.format, p.num_params, midi_str, audio_str);
+                                let input_str = p.input_from.map(|s| format!(" | input: #{}", s)).unwrap_or_default();
+                                println!("  #{}{} {} ({:?}) - {} params{} | midi: {} | audio: {}", p.id, alias_str, p.name, p.format, p.num_params, input_str, midi_str, audio_str);
                             }
+                        }
+                    }
+                    "connect" => {
+                        // plugin connect <source> <target>
+                        if parts.len() != 4 {
+                            cmd_err!("usage: plugin connect <source> <target>");
+                        } else {
+                            match (resolve_plugin_arg(&parts[2]), resolve_plugin_arg(&parts[3])) {
+                                (Some(src), Some(dst)) => match connect_plugins(src, dst) {
+                                    Ok(()) => println!("plugin {} feeds plugin {}", src, dst),
+                                    Err(e) => cmd_err!("error: {}", e),
+                                },
+                                _ => cmd_err!("invalid plugin id or alias"),
+                            }
+                        }
+                    }
+                    "disconnect" => {
+                        // plugin disconnect <target>
+                        if parts.len() != 3 {
+                            cmd_err!("usage: plugin disconnect <target>");
+                        } else if let Some(dst) = resolve_plugin_arg(&parts[2]) {
+                            match disconnect_plugin(dst) {
+                                Ok(()) => println!("plugin {} input disconnected", dst),
+                                Err(e) => cmd_err!("error: {}", e),
+                            }
+                        } else {
+                            cmd_err!("invalid plugin id or alias");
                         }
                     }
                     "unload" => {
@@ -1089,7 +1158,7 @@ fn run_line(line: &str) -> bool {
                             println!("  filtered  {:>10}  rejected by channel filter", s.filtered);
                             println!("  queued    {:>10}  waiting for a plugin", s.queued);
                             println!("  delivered {:>10}  handed to plugins", s.delivered);
-                            println!("  deferred  {:>10}  audio blocks skipped, plugin busy (events kept)", s.deferred);
+                            println!("  deferred  {:>10}  audio blocks that waited for a busy plugin", s.deferred);
                             println!("  pending   {:>10}  queued but not yet delivered", s.queued.saturating_sub(s.delivered));
                             println!("  note-on   {:>10}  delivered", s.note_on);
                             println!("  note-off  {:>10}  delivered", s.note_off);

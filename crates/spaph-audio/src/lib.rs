@@ -36,62 +36,230 @@ pub fn get_buffer_size() -> usize { *BUFFER_SIZE.lock().unwrap() }
 pub fn set_device_index(v: Option<usize>) { *DEVICE_INDEX.lock().unwrap() = v; }
 pub fn get_device_index() -> Option<usize> { *DEVICE_INDEX.lock().unwrap() }
 
+/// A plugin in the audio graph.
+///
+/// A node is processed when it is armed (`to_output`, heard on the device) or when it is part
+/// of a link (`plugin connect`), even if it is not armed: it then only feeds other plugins.
 pub struct ActivePlugin {
     pub id: u32,
     pub instance: Arc<Mutex<Box<dyn PluginInstance>>>,
     pub gain: Arc<Mutex<f32>>,
     pub midi_queue: Arc<Mutex<Vec<MidiEvent>>>,
+    /// Channel counts, read once when the node is attached (no locking in the audio thread).
+    pub num_inputs: usize,
+    pub num_outputs: usize,
+    /// Mixed to the output device.
+    pub to_output: bool,
 }
 
 static ACTIVE: OnceLock<Arc<Mutex<Vec<ActivePlugin>>>> = OnceLock::new();
+
+/// Explicit audio links as `(target, source)`, replaced by `set_links`.
+static LINKS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
 
 fn active_list() -> Arc<Mutex<Vec<ActivePlugin>>> {
     ACTIVE.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone()
 }
 
+/// Ids of the plugins mixed to the output device (armed with `audio connect`).
 pub fn active_ids() -> Vec<u32> {
-    active_list().lock().unwrap().iter().map(|p| p.id).collect()
+    active_list().lock().unwrap().iter().filter(|p| p.to_output).map(|p| p.id).collect()
 }
 
-pub fn arm(id: u32, instance: Arc<Mutex<Box<dyn PluginInstance>>>, gain: Arc<Mutex<f32>>, midi_queue: Arc<Mutex<Vec<MidiEvent>>>) -> Result<()> {
+/// Which nodes must stay in the graph: armed nodes, and every node that is an end of a link.
+/// Returns the ids to keep.
+pub fn nodes_to_keep(nodes: &[(u32, bool)], links: &[(u32, u32)]) -> Vec<u32> {
+    nodes
+        .iter()
+        .filter(|(id, armed)| *armed || links.iter().any(|(t, s)| t == id || s == id))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Remove nodes that are neither armed nor linked, and deactivate them.
+fn prune(links: &[(u32, u32)]) {
+    let active = active_list();
+    let removed: Vec<ActivePlugin> = {
+        let mut guard = active.lock().unwrap();
+        let nodes: Vec<(u32, bool)> = guard.iter().map(|p| (p.id, p.to_output)).collect();
+        let keep = nodes_to_keep(&nodes, links);
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < guard.len() {
+            if keep.contains(&guard[i].id) {
+                i += 1;
+            } else {
+                removed.push(guard.remove(i));
+            }
+        }
+        removed
+    };
+    for ap in removed {
+        if let Ok(mut inst) = ap.instance.lock() {
+            inst.deactivate();
+        }
+    }
+}
+
+/// Add a plugin to the graph (activating it), or update an existing node. `to_output` marks
+/// it as mixed to the device; an existing node keeps its flag unless `to_output` is true.
+pub fn attach(
+    id: u32,
+    instance: Arc<Mutex<Box<dyn PluginInstance>>>,
+    gain: Arc<Mutex<f32>>,
+    midi_queue: Arc<Mutex<Vec<MidiEvent>>>,
+    to_output: bool,
+) -> Result<()> {
     let active = active_list();
     let mut guard = active.lock().unwrap();
-    if guard.iter().any(|p| p.id == id) {
+    if let Some(node) = guard.iter_mut().find(|p| p.id == id) {
+        if to_output {
+            node.to_output = true;
+        }
         return Ok(());
     }
-    {
+    let (num_inputs, num_outputs) = {
         let mut inst = instance.lock().unwrap();
         inst.set_sample_rate(get_sample_rate() as f64);
         inst.set_block_size(get_buffer_size());
         let _ = inst.activate();
-    }
-    guard.push(ActivePlugin { id, instance, gain, midi_queue });
+        let info = inst.info();
+        (info.num_inputs as usize, info.num_outputs as usize)
+    };
+    guard.push(ActivePlugin { id, instance, gain, midi_queue, num_inputs, num_outputs, to_output });
     Ok(())
 }
 
+/// Mix plugin `id` to the output device (`audio connect`). Adds it if needed.
+pub fn arm(id: u32, instance: Arc<Mutex<Box<dyn PluginInstance>>>, gain: Arc<Mutex<f32>>, midi_queue: Arc<Mutex<Vec<MidiEvent>>>) -> Result<()> {
+    attach(id, instance, gain, midi_queue, true)
+}
+
+/// Stop mixing plugin `id` to the device (`audio disconnect <id>`). A plugin that is still
+/// part of a link keeps processing, so the chain keeps working.
 pub fn disarm(id: u32) -> Result<()> {
-    let active = active_list();
-    let mut guard = active.lock().unwrap();
-    if let Some(pos) = guard.iter().position(|p| p.id == id) {
-        let ap = guard.remove(pos);
-        drop(guard);
+    let links = LINKS.lock().unwrap().clone();
+    if let Some(node) = active_list().lock().unwrap().iter_mut().find(|p| p.id == id) {
+        node.to_output = false;
+    }
+    prune(&links);
+    Ok(())
+}
+
+/// Stop mixing every plugin to the device. Links keep working.
+pub fn unmix_all() {
+    let links = LINKS.lock().unwrap().clone();
+    for node in active_list().lock().unwrap().iter_mut() {
+        node.to_output = false;
+    }
+    prune(&links);
+}
+
+/// Replace the link list and drop nodes that are no longer needed.
+pub fn set_links(links: &[(u32, u32)]) {
+    *LINKS.lock().unwrap() = links.to_vec();
+    prune(links);
+}
+
+/// Remove plugin `id` from the graph (unload). Deactivates it.
+pub fn detach(id: u32) {
+    let removed = {
+        let active = active_list();
+        let mut guard = active.lock().unwrap();
+        guard.iter().position(|p| p.id == id).map(|pos| guard.remove(pos))
+    };
+    if let Some(ap) = removed {
         if let Ok(mut inst) = ap.instance.lock() {
             inst.deactivate();
         }
     }
-    Ok(())
+    let links: Vec<(u32, u32)> = LINKS.lock().unwrap().iter().copied().filter(|(t, s)| *t != id && *s != id).collect();
+    set_links(&links);
 }
 
+/// Remove every node and deactivate it (shutdown).
 pub fn disarm_all() {
     let active = active_list();
-    let all: Vec<ActivePlugin> = {
-        let mut guard = active.lock().unwrap();
-        guard.drain(..).collect()
-    };
+    let all: Vec<ActivePlugin> = active.lock().unwrap().drain(..).collect();
     for ap in all {
         if let Ok(mut inst) = ap.instance.lock() {
             inst.deactivate();
         }
+    }
+}
+
+/// Lock a plugin instance for one audio block. A plugin that is busy (for example during
+/// `plugin show`) is waited for, not skipped: a skipped block would output silence, and any
+/// effect downstream of it would lose its input and its tail.
+fn lock_instance(m: &Mutex<Box<dyn PluginInstance>>) -> std::sync::MutexGuard<'_, Box<dyn PluginInstance>> {
+    match m.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            midi_stats::on_deferred();
+            m.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+}
+
+/// Order in which the graph must be rendered: each node after its source. `sources[i]` is the
+/// index of node `i`'s source, if any. Cycles cannot be created through `connect`; if one is
+/// present anyway, the remaining nodes are appended in index order so every node is rendered.
+pub fn topological_order(sources: &[Option<usize>]) -> Vec<usize> {
+    let n = sources.len();
+    let mut placed = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    while order.len() < n {
+        let before = order.len();
+        for i in 0..n {
+            if placed[i] {
+                continue;
+            }
+            let ready = match sources[i] {
+                Some(s) if s < n => placed[s],
+                _ => true,
+            };
+            if ready {
+                placed[i] = true;
+                order.push(i);
+            }
+        }
+        if order.len() == before {
+            for i in 0..n {
+                if !placed[i] {
+                    placed[i] = true;
+                    order.push(i);
+                }
+            }
+        }
+    }
+    order
+}
+
+/// Fill `dst` from `src` with the channel mapping used for links:
+/// same count copies, mono to stereo duplicates, stereo to mono sums at -3 dB.
+/// Without a source, `dst` is silence.
+pub fn route_channels(src: &[&[f32]], dst: &mut [&mut [f32]]) {
+    let ns = src.len();
+    let nd = dst.len();
+    if ns == 0 {
+        for d in dst.iter_mut() {
+            d.fill(0.0);
+        }
+        return;
+    }
+    if ns == 2 && nd == 1 {
+        let (l, r) = (src[0], src[1]);
+        for (i, out) in dst[0].iter_mut().enumerate() {
+            *out = (l[i] + r[i]) * std::f32::consts::FRAC_1_SQRT_2;
+        }
+        return;
+    }
+    for (c, d) in dst.iter_mut().enumerate() {
+        let s = src[c % ns];
+        let n = d.len().min(s.len());
+        d[..n].copy_from_slice(&s[..n]);
+        d[n..].fill(0.0);
     }
 }
 
@@ -247,7 +415,20 @@ pub fn start_stream() -> Result<()> {
     let active = active_list();
     let channels_c = channels;
 
+    // Scratch buffers reused across blocks (one set per stream), so the audio thread does not
+    // allocate the sample buffers on every block.
+    #[derive(Default)]
+    struct Scratch {
+        // [node][channel][frame]: each node's output for the current block
+        outs: Vec<Vec<Vec<f32>>>,
+        // [channel][frame]: input of the node being rendered
+        ins: Vec<Vec<f32>>,
+    }
+    let scratch = Mutex::new(Scratch::default());
+
     // Renders one block as f32; converted to the device's sample format by `open_stream`.
+    // Nodes run in link order, so a node's input is its source's output for this block.
+    // Only armed nodes are mixed to the device.
     let render = move |data: &mut [f32]| {
         data.fill(0.0);
         let frames = if channels_c > 0 { data.len() / channels_c } else { 0 };
@@ -258,25 +439,75 @@ pub fn start_stream() -> Result<()> {
             Ok(g) => g,
             Err(_) => return,
         };
+        let links = match LINKS.try_lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let mut sc = scratch.lock().unwrap();
+        let Scratch { outs, ins } = &mut *sc;
         let master = get_master_gain();
-        for plugin in active.iter() {
+
+        // Index in `active` of each node's source, if the source is in the graph.
+        let sources: Vec<Option<usize>> = active
+            .iter()
+            .map(|node| {
+                links
+                    .iter()
+                    .find(|(target, _)| *target == node.id)
+                    .and_then(|(_, source)| active.iter().position(|p| p.id == *source))
+            })
+            .collect();
+        let order = topological_order(&sources);
+        if outs.len() < active.len() {
+            outs.resize_with(active.len(), Vec::new);
+        }
+
+        for &idx in &order {
+            let node = &active[idx];
+            let po = node.num_outputs.max(1);
+            let nt = node.num_inputs;
+
+            // Input: the source's output for this block, mapped to this node's channel count.
+            if ins.len() < nt {
+                ins.resize_with(nt, Vec::new);
+            }
+            for ch in ins.iter_mut().take(nt) {
+                if ch.len() < frames {
+                    ch.resize(frames, 0.0);
+                }
+            }
+            {
+                let mut dst: Vec<&mut [f32]> = ins.iter_mut().take(nt).map(|b| &mut b[..frames]).collect();
+                match sources[idx] {
+                    Some(sidx) => {
+                        let src: Vec<&[f32]> = outs[sidx]
+                            .iter()
+                            .filter(|b| b.len() >= frames)
+                            .map(|b| &b[..frames])
+                            .collect();
+                        route_channels(&src, &mut dst);
+                    }
+                    None => route_channels(&[], &mut dst),
+                }
+            }
+
+            // Output buffers for this node, cleared so a node that is skipped below is silent.
+            let out_bufs = &mut outs[idx];
+            out_bufs.resize_with(po, Vec::new);
+            for b in out_bufs.iter_mut() {
+                if b.len() < frames {
+                    b.resize(frames, 0.0);
+                }
+                b[..frames].fill(0.0);
+            }
+
             // Lock the instance first. If another thread holds it, leave the queued MIDI
             // events where they are and try again on the next block; taking them first would
             // throw them away (lost note-offs).
-            let mut inst = match plugin.instance.try_lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    midi_stats::on_deferred();
-                    continue;
-                }
-            };
-            let po = {
-                let n = inst.info().num_outputs as usize;
-                if n == 0 { 1 } else { n }
-            };
+            let mut inst = lock_instance(&node.instance);
             // Never block the audio thread on the queue: if the MIDI thread is pushing right
             // now, play this block without new events and deliver them on the next one.
-            let events: Vec<MidiEvent> = plugin
+            let events: Vec<MidiEvent> = node
                 .midi_queue
                 .try_lock()
                 .map(|mut q| std::mem::take(&mut *q))
@@ -287,17 +518,17 @@ pub fn start_stream() -> Result<()> {
             if !events.is_empty() {
                 inst.handle_midi_events(&events);
             }
-            let mut scratch = vec![vec![0.0f32; frames]; po];
-            let mut out_refs: Vec<&mut [f32]> = scratch.iter_mut().map(|v| v.as_mut_slice()).collect();
-            let inputs: &[&[f32]] = &[];
-            inst.process(inputs, &mut out_refs, frames);
+            let in_refs: Vec<&[f32]> = ins.iter().take(nt).map(|b| &b[..frames]).collect();
+            let mut out_refs: Vec<&mut [f32]> = outs[idx].iter_mut().map(|b| &mut b[..frames]).collect();
+            inst.process(&in_refs, &mut out_refs, frames);
             drop(inst);
-            let gain = plugin.gain.try_lock().map(|g| *g).unwrap_or(1.0);
-            for f in 0..frames {
-                for c in 0..channels_c {
-                    let src_ch = if po > 0 { c % po } else { 0 };
-                    if src_ch < scratch.len() {
-                        data[f * channels_c + c] += scratch[src_ch][f] * gain * master;
+
+            if node.to_output {
+                let gain = node.gain.try_lock().map(|g| *g).unwrap_or(1.0);
+                let out = &outs[idx];
+                for f in 0..frames {
+                    for c in 0..channels_c {
+                        data[f * channels_c + c] += out[c % po][f] * gain * master;
                     }
                 }
             }
@@ -487,6 +718,112 @@ mod tests {
         let list = backend_list();
         assert!(!list.is_empty());
         assert!(list.iter().filter(|(_, _, in_use)| *in_use).count() <= 1);
+    }
+
+    #[test]
+    fn order_renders_source_before_target() {
+        // node 0 reads node 1, node 1 reads node 2, node 2 is a generator
+        assert_eq!(topological_order(&[Some(1), Some(2), None]), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn order_fan_out_keeps_source_first() {
+        assert_eq!(topological_order(&[None, Some(0), Some(0)]), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn order_ignores_out_of_range_source() {
+        assert_eq!(topological_order(&[Some(7), None]), vec![0, 1]);
+    }
+
+    #[test]
+    fn order_terminates_on_cycle_and_keeps_every_node() {
+        let order = topological_order(&[Some(1), Some(0)]);
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1]);
+    }
+
+    #[test]
+    fn lock_instance_waits_for_busy_plugin_instead_of_skipping() {
+        let m: Arc<Mutex<Box<dyn PluginInstance>>> = Arc::new(Mutex::new(Box::new(NullPlugin)));
+        let holder = {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                let _guard = m.lock().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Blocks until the holder releases, then returns the instance (no skipped block).
+        let start = std::time::Instant::now();
+        let _g = lock_instance(&m);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(10));
+        holder.join().unwrap();
+    }
+
+    struct NullPlugin;
+    impl PluginInstance for NullPlugin {
+        fn info(&self) -> &spaph_plugin::PluginInfo { unimplemented!() }
+        fn set_sample_rate(&mut self, _sr: f64) {}
+        fn process(&mut self, _i: &[&[f32]], _o: &mut [&mut [f32]], _n: usize) {}
+        fn get_param(&self, _index: u32) -> f64 { 0.0 }
+        fn set_param(&mut self, _index: u32, _value: f64) {}
+        fn save_state(&self) -> spaph_types::Result<Vec<u8>> { Ok(vec![]) }
+        fn load_state(&mut self, _data: &[u8]) -> spaph_types::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn route_same_channel_count_copies() {
+        let (l, r) = ([1.0f32, 2.0], [3.0f32, 4.0]);
+        let mut a = [0.0f32; 2];
+        let mut b = [0.0f32; 2];
+        route_channels(&[&l, &r], &mut [&mut a, &mut b]);
+        assert_eq!(a, [1.0, 2.0]);
+        assert_eq!(b, [3.0, 4.0]);
+    }
+
+    #[test]
+    fn route_mono_to_stereo_duplicates() {
+        let m = [0.5f32, -0.5];
+        let mut a = [0.0f32; 2];
+        let mut b = [0.0f32; 2];
+        route_channels(&[&m], &mut [&mut a, &mut b]);
+        assert_eq!(a, [0.5, -0.5]);
+        assert_eq!(b, [0.5, -0.5]);
+    }
+
+    #[test]
+    fn route_stereo_to_mono_sums_at_minus_3db() {
+        let (l, r) = ([1.0f32], [1.0f32]);
+        let mut m = [0.0f32; 1];
+        route_channels(&[&l, &r], &mut [&mut m]);
+        assert!((m[0] - std::f32::consts::FRAC_1_SQRT_2 * 2.0).abs() < 1e-6, "{}", m[0]);
+    }
+
+    #[test]
+    fn route_without_source_gives_silence() {
+        let mut a = [9.0f32; 2];
+        route_channels(&[], &mut [&mut a]);
+        assert_eq!(a, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn kept_nodes_are_armed_or_linked() {
+        // (id, armed); links are (target, source)
+        let nodes = [(1, true), (2, false), (3, false), (4, false)];
+        let links = [(2, 1)]; // 1 feeds 2 (2 is not armed)
+        let keep = nodes_to_keep(&nodes, &links);
+        assert!(keep.contains(&1), "armed node kept");
+        assert!(keep.contains(&2), "linked target kept even if not armed");
+        assert!(!keep.contains(&3), "unarmed unlinked node dropped");
+        assert!(!keep.contains(&4));
+    }
+
+    #[test]
+    fn kept_nodes_drop_unlinked_after_disconnect() {
+        let nodes = [(2, false)];
+        assert!(nodes_to_keep(&nodes, &[]).is_empty());
     }
 
     #[test]

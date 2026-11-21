@@ -83,6 +83,12 @@ connect audio 1 0 48000 256
 - `midi listen` is interactive only: it is skipped with a warning in a script.
 - `load <script>` runs another script, path relative to the config file. It nests up to 8 levels.
 - `plugin unload all` unloads every plugin, disconnecting its audio and MIDI.
+- `plugin connect <src> <dst>` feeds the output of plugin `src` into the audio input of plugin
+  `dst` (mono and stereo; stereo to mono is summed at -3 dB). `plugin disconnect <dst>` removes
+  that input. Connections are explicit only: nothing is connected implicitly. A plugin is heard
+  on the output only if it is connected with `audio connect`, so a chain ending in an effect
+  needs `audio connect <effect> <device>`. A plugin can feed several targets, but each target has
+  one source. Cycles are rejected. Unloading a plugin removes its links.
 - `plugin load <path> as <name>` gives a plugin an alias. Any command that takes a plugin id
   also accepts the alias, e.g. `midi connect 0 synth`. Aliases are case-sensitive, must start
   with a letter or `_`, may contain letters, digits, `_` and `-`, and cannot be `all`. An alias

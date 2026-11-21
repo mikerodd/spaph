@@ -194,3 +194,13 @@ fn osc_alias_reaches_the_same_resolver() {
     assert_eq!(code, Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn osc_plugin_disconnect_reaches_the_same_handler() {
+    let dir = scratch("disc");
+    let s = Session::start(&dir);
+    s.osc_expect("plugin disconnect 99", "no plugin with id 99");
+    let (code, _, _) = s.finish();
+    assert_eq!(code, Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}

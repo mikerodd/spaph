@@ -40,6 +40,10 @@ impl PluginFactory for Vst2Factory {
         let mut loader = PluginLoader::load(path, host.clone())
             .map_err(|e| SpaphError::Plugin(e.to_string()))?;
         let mut inst = loader.instance().map_err(|e| SpaphError::Plugin(e.to_string()))?;
+        // effOpen (`init`) must come before the editor rect is queried: some plugins (e.g. DPF
+        // based, such as MVerb) report a 0x0 rect until they are opened. It is called once
+        // here; `init` below then skips it, as the SDK expects effOpen exactly once.
+        inst.init();
         // The VST2 SDK has no "has editor" query on the host side; a plugin without a GUI
         // reports an empty editor rect. get_editor() can only be called once per instance,
         // so keep the editor for the lifetime of the plugin.
@@ -86,6 +90,7 @@ impl PluginFactory for Vst2Factory {
             // Declared before `_instance` so the editor is dropped first.
             editor_slot: Arc::new(Mutex::new(editor.map(SendEditor))),
             _instance: inst,
+            opened: true,
             sample_rate: 48000.0,
         }))
     }
@@ -142,6 +147,8 @@ pub struct Vst2Instance {
     /// The editor while no window is open; taken by `open_editor_session` and returned on close.
     editor_slot: Arc<Mutex<Option<SendEditor>>>,
     _instance: vst::host::PluginInstance,
+    /// effOpen has already been sent (at load); `init` must not send it again.
+    opened: bool,
     sample_rate: f64,
 }
 
@@ -159,7 +166,10 @@ impl SpaphPluginInstance for Vst2Instance {
         self._instance.set_block_size(n as i64);
     }
     fn init(&mut self) {
-        self._instance.init();
+        if !self.opened {
+            self._instance.init();
+            self.opened = true;
+        }
     }
     fn resume(&mut self) {
         self._instance.resume();
