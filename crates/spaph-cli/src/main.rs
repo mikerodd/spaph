@@ -139,7 +139,9 @@ fn resolve_plugin_arg(token: &str) -> Option<u32> {
 }
 
 fn load_plugin(path: &PathBuf, alias: Option<&str>) -> Result<()> {
+    tracing::info!("load: calling plugin loader for {}", path.display());
     let id = manager().lock().unwrap().load_as(path, alias)?;
+    tracing::info!("load: plugin registered as #{}", id);
     let mgr = manager().lock().unwrap();
     let summary = mgr.list().into_iter().find(|s| s.id == id).unwrap();
     drop(mgr);

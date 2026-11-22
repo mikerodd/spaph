@@ -60,25 +60,28 @@ impl PluginFactory for Vst2Factory {
         tracing::info!("vst2 load: info '{}' {} inputs, {} outputs, {} params", vst_info.name, vst_info.inputs, vst_info.outputs, vst_info.parameters);
         let params = inst.get_parameter_object();
         let num = vst_info.parameters.max(0) as u32;
+        tracing::info!("vst2 load: reading {} parameters", num);
         let mut param_infos = Vec::with_capacity(num as usize);
         for i in 0..num {
-            param_infos.push(ParamInfo {
-                index: i,
-                name: params.get_parameter_name(i as i32),
-                default_value: params.get_parameter(i as i32) as f64,
-                min: 0.0,
-                max: 1.0,
-            });
+            tracing::debug!("vst2 load: param {} name", i);
+            let name = params.get_parameter_name(i as i32);
+            tracing::debug!("vst2 load: param {} '{}' value", i, name);
+            let default_value = params.get_parameter(i as i32) as f64;
+            param_infos.push(ParamInfo { index: i, name, default_value, min: 0.0, max: 1.0 });
         }
+        tracing::info!("vst2 load: parameters read");
         let num_presets = vst_info.presets.max(0) as usize;
+        tracing::info!("vst2 load: reading {} presets", num_presets);
         let mut preset_names = Vec::with_capacity(num_presets);
         let orig = params.get_preset_num();
         for i in 0..num_presets {
+            tracing::debug!("vst2 load: preset {} select", i);
             params.change_preset(i as i32);
             let name = params.get_current_preset_name();
             preset_names.push(if name.is_empty() { format!("Preset {}", i + 1) } else { name });
         }
         params.change_preset(orig);
+        tracing::info!("vst2 load: presets read, building plugin info");
         let info = SpaphPluginInfo {
             name: vst_info.name.clone(),
             vendor: vst_info.vendor.clone(),
