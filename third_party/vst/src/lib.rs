@@ -128,6 +128,7 @@ pub mod editor;
 pub mod event;
 pub mod host;
 mod interfaces;
+pub use interfaces::set_realtime_thread;
 pub mod plugin;
 pub mod prelude;
 pub mod util;

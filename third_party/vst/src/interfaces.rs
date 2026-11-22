@@ -298,6 +298,16 @@ pub extern "C" fn dispatch(
     0
 }
 
+thread_local! {
+    static PROCESS_LEVEL: std::cell::Cell<isize> = const { std::cell::Cell::new(1) };
+}
+
+/// Mark the calling thread as the audio (realtime) thread (`true`) or not (`false`). Plugins
+/// ask the host for this level (`audioMasterGetCurrentProcessLevel`).
+pub fn set_realtime_thread(realtime: bool) {
+    PROCESS_LEVEL.with(|l| l.set(if realtime { 2 } else { 1 }));
+}
+
 pub fn host_dispatch(
     host: &mut dyn Host,
     effect: *mut AEffect,
@@ -359,6 +369,9 @@ pub fn host_dispatch(
         }
         Ok(OpCode::GetSampleRate) => { eprintln!("HOST GetSampleRate -> {}", host.get_sample_rate()); return host.get_sample_rate() as isize; }
         Ok(OpCode::GetBlockSize) => return host.get_block_size(),
+        // Process level of the calling thread (VstProcessLevels: 1 = user, 2 = realtime).
+        // Set by `set_process_level` around each audio call; default is user.
+        Ok(OpCode::GetCurrentProcessLevel) => return PROCESS_LEVEL.with(|l| l.get()),
 
         _ => {
             trace!("VST: Got unimplemented host opcode ({:?})", opcode);

@@ -195,7 +195,16 @@ impl SpaphPluginInstance for Vst2Instance {
                 num_frames,
             )
         };
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "vst2 process: first block for '{}' ({} frames, {} in, {} out)",
+                self.info.name, num_frames, input_ptrs.len(), output_ptrs.len()
+            );
+        }
+        vst::set_realtime_thread(true);
         self._instance.process(&mut audio);
+        vst::set_realtime_thread(false);
     }
 
     fn handle_midi(&mut self, event: &MidiEvent) {
