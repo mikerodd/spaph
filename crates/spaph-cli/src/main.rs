@@ -1026,7 +1026,8 @@ fn run_line(line: &str) -> bool {
                                             let info = inst.info();
                                             for p in &info.params {
                                                 let val = inst.get_param(p.index);
-                                                println!("  [{}] {} = {:.4} (range {}..{})", p.index, p.name, val, p.min, p.max);
+                                                let name = inst.param_name(p.index);
+                                                println!("  [{}] {} = {:.4} (range {}..{})", p.index, name, val, p.min, p.max);
                                             }
                                         } else {
                                             cmd_err!("plugin {} not found", pid);

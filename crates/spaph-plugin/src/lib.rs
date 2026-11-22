@@ -39,6 +39,11 @@ pub trait EditorSession {
 /// A loaded plugin instance.
 pub trait PluginInstance: Send {
     fn info(&self) -> &PluginInfo;
+    /// Name of parameter `index`. Read on demand, so the plugin is not queried for every
+    /// parameter at load time (some plugins crash on that). The default uses `info()`.
+    fn param_name(&self, index: u32) -> String {
+        self.info().params.iter().find(|p| p.index == index).map(|p| p.name.clone()).unwrap_or_default()
+    }
     fn set_sample_rate(&mut self, sr: f64);
     fn set_block_size(&mut self, _n: usize) {}
     fn init(&mut self) {}
@@ -121,6 +126,34 @@ mod tests {
     #[test]
     fn format_from_path_vst3() {
         assert_eq!(format_from_path(Path::new("foo.vst3")), Some(PluginFormat::Vst3));
+    }
+
+    struct Named(PluginInfo);
+    impl PluginInstance for Named {
+        fn info(&self) -> &PluginInfo { &self.0 }
+        fn set_sample_rate(&mut self, _sr: f64) {}
+        fn process(&mut self, _i: &[&[f32]], _o: &mut [&mut [f32]], _n: usize) {}
+        fn get_param(&self, _index: u32) -> f64 { 0.0 }
+        fn set_param(&mut self, _index: u32, _value: f64) {}
+        fn save_state(&self) -> spaph_types::Result<Vec<u8>> { Ok(vec![]) }
+        fn load_state(&mut self, _data: &[u8]) -> spaph_types::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn default_param_name_comes_from_info() {
+        let info = PluginInfo {
+            name: "t".into(),
+            vendor: "v".into(),
+            version: "1".into(),
+            format: PluginFormat::Vst2,
+            num_inputs: 2,
+            num_outputs: 2,
+            params: vec![ParamInfo { index: 0, name: "Gain".into(), default_value: 0.0, min: 0.0, max: 1.0 }],
+            presets: vec![],
+        };
+        let p = Named(info);
+        assert_eq!(p.param_name(0), "Gain");
+        assert_eq!(p.param_name(9), "");
     }
 
     #[test]

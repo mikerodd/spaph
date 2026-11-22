@@ -558,7 +558,9 @@ trait Dispatch {
     }
 
     fn read_string_param(&self, opcode: plugin::OpCode, index: i32, value: isize, opt: f32, max: usize) -> String {
-        let mut buf = vec![0; max];
+        // The plugin is not told the buffer size here. Give it room well beyond the SDK limit
+        // (32 bytes), so a plugin that writes a longer string cannot corrupt the heap.
+        let mut buf = vec![0; max.max(256)];
         self.dispatch(opcode, index, value, buf.as_mut_ptr() as *mut c_void, opt);
         String::from_utf8_lossy(&buf)
             .chars()

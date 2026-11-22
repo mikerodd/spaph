@@ -60,16 +60,13 @@ impl PluginFactory for Vst2Factory {
         tracing::info!("vst2 load: info '{}' {} inputs, {} outputs, {} params", vst_info.name, vst_info.inputs, vst_info.outputs, vst_info.parameters);
         let params = inst.get_parameter_object();
         let num = vst_info.parameters.max(0) as u32;
-        tracing::info!("vst2 load: reading {} parameters", num);
-        let mut param_infos = Vec::with_capacity(num as usize);
-        for i in 0..num {
-            tracing::debug!("vst2 load: param {} name", i);
-            let name = params.get_parameter_name(i as i32);
-            tracing::debug!("vst2 load: param {} '{}' value", i, name);
-            let default_value = params.get_parameter(i as i32) as f64;
-            param_infos.push(ParamInfo { index: i, name, default_value, min: 0.0, max: 1.0 });
-        }
-        tracing::info!("vst2 load: parameters read");
+        // Parameter names and values are NOT read here: querying every parameter during load
+        // crashed Strum GS-2 (Windows) at parameter 4. Names come from `param_name` and values
+        // from `get_param`, both on demand.
+        tracing::info!("vst2 load: {} parameters (read on demand)", num);
+        let param_infos: Vec<ParamInfo> = (0..num)
+            .map(|i| ParamInfo { index: i, name: String::new(), default_value: 0.0, min: 0.0, max: 1.0 })
+            .collect();
         let num_presets = vst_info.presets.max(0) as usize;
         tracing::info!("vst2 load: reading {} presets", num_presets);
         let mut preset_names = Vec::with_capacity(num_presets);
@@ -314,6 +311,9 @@ impl SpaphPluginInstance for Vst2Instance {
 
     fn get_param(&self, index: u32) -> f64 {
         self.params.get_parameter(index as i32) as f64
+    }
+    fn param_name(&self, index: u32) -> String {
+        self.params.get_parameter_name(index as i32)
     }
     fn set_param(&mut self, index: u32, value: f64) {
         self.params.set_parameter(index as i32, value as f32);
