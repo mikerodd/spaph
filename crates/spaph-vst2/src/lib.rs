@@ -36,20 +36,28 @@ impl PluginFactory for Vst2Factory {
             .unwrap_or(false)
     }
     fn load(&self, path: &Path) -> Result<Box<dyn SpaphPluginInstance>> {
+        // Load steps are traced at info level: if the plugin crashes the process, the last
+        // step printed shows where it died.
+        tracing::info!("vst2 load: loading library {}", path.display());
         let host = Arc::new(Mutex::new(Vst2Host { block_size: std::sync::Mutex::new(512) }));
         let mut loader = PluginLoader::load(path, host.clone())
             .map_err(|e| SpaphError::Plugin(e.to_string()))?;
+        tracing::info!("vst2 load: library loaded, creating instance");
         let mut inst = loader.instance().map_err(|e| SpaphError::Plugin(e.to_string()))?;
+        tracing::info!("vst2 load: instance created, calling effOpen");
         // effOpen (`init`) must come before the editor rect is queried: some plugins (e.g. DPF
         // based, such as MVerb) report a 0x0 rect until they are opened. It is called once
         // here; `init` below then skips it, as the SDK expects effOpen exactly once.
         inst.init();
+        tracing::info!("vst2 load: effOpen done, querying editor rect");
         // The VST2 SDK has no "has editor" query on the host side; a plugin without a GUI
         // reports an empty editor rect. get_editor() can only be called once per instance,
         // so keep the editor for the lifetime of the plugin.
         let editor = inst.get_editor().filter(|e| e.size() != (0, 0));
         let has_gui = editor.is_some();
+        tracing::info!("vst2 load: editor {}", if has_gui { "present" } else { "absent" });
         let vst_info: VstInfo = inst.get_info();
+        tracing::info!("vst2 load: info '{}' {} inputs, {} outputs, {} params", vst_info.name, vst_info.inputs, vst_info.outputs, vst_info.parameters);
         let params = inst.get_parameter_object();
         let num = vst_info.parameters.max(0) as u32;
         let mut param_infos = Vec::with_capacity(num as usize);

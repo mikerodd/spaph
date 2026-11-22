@@ -1559,7 +1559,27 @@ fn run_script(path: &Path) -> std::result::Result<(), String> {
     result
 }
 
+/// Last-chance handler for crashes (e.g. a plugin dereferencing a bad pointer). Without it
+/// Windows ends the process silently; this prints the exception code and address first.
+#[cfg(windows)]
+unsafe extern "system" fn report_crash(
+    info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
+) -> winapi::um::winnt::LONG {
+    let record = (*info).ExceptionRecord;
+    eprintln!(
+        "spaph: fatal exception 0x{:08X} at address 0x{:X} (the program stops; see the last log lines above)",
+        (*record).ExceptionCode,
+        (*record).ExceptionAddress as usize
+    );
+    // EXCEPTION_EXECUTE_HANDLER: terminate after reporting.
+    1
+}
+
 fn main() {
+    #[cfg(windows)]
+    unsafe {
+        winapi::um::errhandlingapi::SetUnhandledExceptionFilter(Some(report_crash));
+    }
     let _ = CONSOLE_THREAD.set(std::thread::current().id());
     let cli = Cli::parse();
     let (config_path, mut cfg) = load_startup_config(&cli);

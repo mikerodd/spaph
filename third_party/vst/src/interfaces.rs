@@ -309,7 +309,18 @@ pub fn host_dispatch(
 ) -> isize {
     use crate::host::OpCode;
 
+    let raw_opcode = opcode;
     let opcode = OpCode::try_from(opcode);
+    // spaph diagnostics: every host callback is traced (debug level). Opcodes the host does not
+    // implement (including vendor-specific ones such as NI's) are logged at info level with
+    // their raw number, because they answer 0 silently and a plugin may then fail on it.
+    match &opcode {
+        Ok(op) => debug!("host callback {:?} index {} value {} opt {}", op, index, value, opt),
+        Err(_) => info!(
+            "host callback: unimplemented/vendor-specific opcode {} (0x{:x}) index {} value {} opt {} ptr {:?}",
+            raw_opcode, raw_opcode, index, value, opt, ptr
+        ),
+    }
     match opcode {
         Ok(OpCode::Version) => return 2400,
         Ok(OpCode::Automate) => host.automate(index, opt),
