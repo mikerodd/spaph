@@ -1568,11 +1568,46 @@ fn run_script(path: &Path) -> std::result::Result<(), String> {
 unsafe extern "system" fn report_crash(
     info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
 ) -> winapi::um::winnt::LONG {
+    use winapi::um::libloaderapi::{
+        GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
     let record = (*info).ExceptionRecord;
+    let addr = (*record).ExceptionAddress as usize;
+    // Which module (plugin DLL or host) the faulting instruction belongs to, and the offset in it.
+    let mut module = std::ptr::null_mut();
+    let located = GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        addr as *const u16,
+        &mut module,
+    );
+    let (name, offset) = if located != 0 {
+        let mut buf = [0u16; 512];
+        let n = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) as usize;
+        (String::from_utf16_lossy(&buf[..n]), addr - module as usize)
+    } else {
+        ("unknown module".to_string(), 0)
+    };
+    // For access violations: ExceptionInformation[0] is 0 = read, 1 = write, 8 = DEP;
+    // [1] is the address that was accessed. A value near 0 means a null or bad pointer.
+    let access = if (*record).NumberParameters >= 2 {
+        let kind = match (*record).ExceptionInformation[0] {
+            0 => "read",
+            1 => "write",
+            8 => "execute",
+            _ => "?",
+        };
+        format!(" ({} of 0x{:X})", kind, (*record).ExceptionInformation[1])
+    } else {
+        String::new()
+    };
     eprintln!(
-        "spaph: fatal exception 0x{:08X} at address 0x{:X} (the program stops; see the last log lines above)",
+        "spaph: fatal exception 0x{:08X}{} at 0x{:X} in {} + 0x{:X} (the program stops; see the last log lines above)",
         (*record).ExceptionCode,
-        (*record).ExceptionAddress as usize
+        access,
+        addr,
+        name,
+        offset
     );
     // EXCEPTION_EXECUTE_HANDLER: terminate after reporting.
     1
