@@ -394,6 +394,10 @@ fn open_stream(
 }
 
 pub fn start_stream() -> Result<()> {
+    // Capture the device list before the stream loads its driver (ASIO allows only one loaded
+    // driver at a time, and enumeration stops at the first driver that is already loaded).
+    // Done before taking the STREAM lock, since list_devices checks it.
+    let _ = list_devices();
     let mut slot = STREAM.lock().unwrap();
     if slot.is_some() {
         return Ok(());
@@ -610,7 +614,13 @@ pub fn start_stream_with(sample_rate: Option<u32>, buffer_size: Option<u32>, dev
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Device names of the selected backend, captured while no driver is in use (see `start_stream`).
+static DEVICE_NAMES: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
 pub fn list_devices() -> Result<Vec<String>> {
+    if let Some(cached) = DEVICE_NAMES.lock().unwrap().clone() {
+        return Ok(cached);
+    }
     ensure_pulse_prop();
     let host = current_host()?;
     // Keep every device (even unnamed ones) so positions match the indices used by start_stream.
@@ -623,6 +633,10 @@ pub fn list_devices() -> Result<Vec<String>> {
                 .unwrap_or_else(|_| "(unnamed device)".to_string());
             out.push(name);
         }
+    }
+    // Only cache a complete list: while a stream holds a driver, enumeration may be partial.
+    if !is_running() {
+        *DEVICE_NAMES.lock().unwrap() = Some(out.clone());
     }
     Ok(out)
 }
@@ -662,6 +676,7 @@ pub fn set_backend(name: Option<&str>) -> Result<()> {
         ),
     };
     *BACKEND.lock().unwrap() = id;
+    *DEVICE_NAMES.lock().unwrap() = None;
     Ok(())
 }
 
