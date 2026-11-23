@@ -24,6 +24,14 @@ impl Host for Vst2Host {
     }
 }
 
+/// Input pointers for a VST2 `processReplacing` call: at least `declared` channels and never
+/// fewer than two, each either the caller's channel or `silent` when the caller has none.
+/// The result is never empty, so the plugin always gets valid pointers.
+pub fn pad_input_pointers(given: &[*const f32], declared: usize, silent: *const f32) -> Vec<*const f32> {
+    let count = given.len().max(declared).max(2);
+    (0..count).map(|i| given.get(i).copied().unwrap_or(silent)).collect()
+}
+
 pub struct Vst2Factory;
 impl PluginFactory for Vst2Factory {
     fn format(&self) -> PluginFormat {
@@ -99,6 +107,7 @@ impl PluginFactory for Vst2Factory {
             editor_slot: Arc::new(Mutex::new(editor.map(SendEditor))),
             _instance: inst,
             opened: true,
+            silence: Vec::new(),
             sample_rate: 48000.0,
         }))
     }
@@ -157,6 +166,8 @@ pub struct Vst2Instance {
     _instance: vst::host::PluginInstance,
     /// effOpen has already been sent (at load); `init` must not send it again.
     opened: bool,
+    /// Zeros used for input channels the caller does not provide. Grown on demand.
+    silence: Vec<f32>,
     sample_rate: f64,
 }
 
@@ -184,7 +195,15 @@ impl SpaphPluginInstance for Vst2Instance {
     }
     fn deactivate(&mut self) {}
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], num_frames: usize) {
-        let input_ptrs: Vec<*const f32> = inputs.iter().map(|b| b.as_ptr()).collect();
+        // Plugins may read input pointers even when they declare no inputs (Strum GS-2 does).
+        // Never hand them an empty array: its pointer is dangling (8), and the plugin crashes
+        // reading it. Missing channels point at silence.
+        if self.silence.len() < num_frames {
+            self.silence.resize(num_frames, 0.0);
+        }
+        let silent = self.silence.as_ptr();
+        let given: Vec<*const f32> = inputs.iter().map(|b| b.as_ptr()).collect();
+        let input_ptrs = pad_input_pointers(&given, self.info.num_inputs as usize, silent);
         let mut output_ptrs: Vec<*mut f32> = outputs.iter_mut().map(|b| b.as_mut_ptr()).collect();
         let mut audio = unsafe {
             vst::buffer::AudioBuffer::from_raw(
@@ -372,5 +391,27 @@ impl SpaphPluginInstance for Vst2Instance {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pad_input_pointers;
+
+    #[test]
+    fn empty_input_array_is_replaced_by_silence_pointers() {
+        // Regression (Strum GS-2, Windows): a plugin with 0 declared inputs read an empty
+        // pointer array (dangling pointer 8) and crashed. Two valid silent channels are given.
+        let silent = 0x1000 as *const f32;
+        let out = pad_input_pointers(&[], 0, silent);
+        assert_eq!(out, vec![silent, silent]);
+    }
+
+    #[test]
+    fn caller_channels_are_kept_and_missing_ones_padded() {
+        let a = 0x2000 as *const f32;
+        let silent = 0x1000 as *const f32;
+        assert_eq!(pad_input_pointers(&[a], 2, silent), vec![a, silent]);
+        assert_eq!(pad_input_pointers(&[a], 3, silent), vec![a, silent, silent]);
     }
 }
