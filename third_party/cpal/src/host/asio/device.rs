@@ -154,11 +154,27 @@ impl fmt::Debug for Device {
     }
 }
 
+/// Diagnostic output for device enumeration, enabled with `SPAPH_ASIO_DEBUG=1`.
+/// Shows each driver and why it is kept or skipped (a driver with no usable output format
+/// is hidden from `audio list`).
+fn asio_debug_enabled() -> bool {
+    std::env::var_os("SPAPH_ASIO_DEBUG").is_some()
+}
+
+macro_rules! asio_debug {
+    ($($arg:tt)*) => {
+        if asio_debug_enabled() {
+            eprintln!("asio: {}", format!($($arg)*));
+        }
+    };
+}
+
 impl Devices {
     pub fn new(asio: Arc<sys::Asio>) -> Result<Self, Error> {
         // Make sure that COM is initialized.
         com::com_initialized();
         let drivers = asio.driver_names().into_iter();
+        asio_debug!("driver list: {:?}", asio.driver_names());
         Ok(Self {
             asio,
             drivers,
@@ -179,10 +195,15 @@ impl Iterator for Devices {
             let name = self.drivers.next()?;
             match self.asio.load_driver(&name) {
                 Ok(driver) => {
-                    let Ok(channels) = driver.channels() else {
-                        continue;
+                    let channels = match driver.channels() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            asio_debug!("'{}': channels() failed: {:?}, skipped", name, e);
+                            continue;
+                        }
                     };
                     if channels.ins == 0 && channels.outs == 0 {
+                        asio_debug!("'{}': no channels, skipped", name);
                         continue;
                     }
 
@@ -190,18 +211,30 @@ impl Iterator for Devices {
                     // stream is active. Treat 0 as "not yet known" rather than skipping.
                     let sample_rate = driver.sample_rate().unwrap_or(0.0);
 
-                    let Ok(buffer_size_range) = driver.buffersize_range() else {
-                        continue;
+                    let buffer_size_range = match driver.buffersize_range() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            asio_debug!("'{}': buffersize_range() failed: {:?}, skipped", name, e);
+                            continue;
+                        }
                     };
 
-                    let input_sample_format = driver
-                        .input_data_type()
-                        .ok()
-                        .and_then(|t| convert_data_type(&t));
-                    let output_sample_format = driver
-                        .output_data_type()
-                        .ok()
-                        .and_then(|t| convert_data_type(&t));
+                    let input_type = driver.input_data_type();
+                    let output_type = driver.output_data_type();
+                    let input_sample_format = input_type.as_ref().ok().and_then(convert_data_type);
+                    let output_sample_format =
+                        output_type.as_ref().ok().and_then(convert_data_type);
+                    asio_debug!(
+                        "'{}': ins={} outs={} rate={} out_type={:?} out_format={:?} buffer={}..{}",
+                        name,
+                        channels.ins,
+                        channels.outs,
+                        sample_rate,
+                        output_type,
+                        output_sample_format,
+                        buffer_size_range.min,
+                        buffer_size_range.max
+                    );
 
                     let supported_sample_rates: Box<[SampleRate]> = crate::COMMON_SAMPLE_RATES
                         .iter()
@@ -227,9 +260,15 @@ impl Iterator for Devices {
                 }
                 // A different driver is already loaded (e.g. an active Stream holds it). Stop
                 // cleanly rather than spinning through the rest of the list.
-                Err(sys::LoadDriverError::DriverAlreadyExists) => return None,
+                Err(sys::LoadDriverError::DriverAlreadyExists) => {
+                    asio_debug!("'{}': another driver is loaded, enumeration stopped", name);
+                    return None;
+                }
                 // Driver failed to load for its own reasons; skip and try the next.
-                Err(_) => continue,
+                Err(e) => {
+                    asio_debug!("'{}': failed to load: {:?}, skipped", name, e);
+                    continue;
+                }
             }
         }
     }
