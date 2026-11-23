@@ -325,6 +325,9 @@ pub fn host_dispatch(
     // implement (including vendor-specific ones such as NI's) are logged at info level with
     // their raw number, because they answer 0 silently and a plugin may then fail on it.
     match &opcode {
+        // Called on every audio block by many plugins: tracing them floods the log.
+        Ok(OpCode::GetTime) | Ok(OpCode::GetCurrentProcessLevel) | Ok(OpCode::GetBlockSize)
+        | Ok(OpCode::GetSampleRate) | Ok(OpCode::Idle) | Ok(OpCode::ProcessEvents) => {}
         Ok(op) => debug!("host callback {:?} index {} value {} opt {}", op, index, value, opt),
         Err(_) => info!(
             "host callback: unimplemented/vendor-specific opcode {} (0x{:x}) index {} value {} opt {} ptr {:?}",
