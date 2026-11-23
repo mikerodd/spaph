@@ -236,11 +236,23 @@ impl Iterator for Devices {
                         buffer_size_range.max
                     );
 
-                    let supported_sample_rates: Box<[SampleRate]> = crate::COMMON_SAMPLE_RATES
+                    let mut supported_sample_rates: Vec<SampleRate> = crate::COMMON_SAMPLE_RATES
                         .iter()
                         .copied()
                         .filter(|&r| driver.can_sample_rate(r.into()).unwrap_or(false))
                         .collect();
+                    // A driver that accepts none of the common rates would have no formats at all,
+                    // and then `supports_output` hides it from device lists. Fall back to the
+                    // rate the driver reports as current.
+                    if supported_sample_rates.is_empty() && sample_rate > 0.0 {
+                        supported_sample_rates.push(sample_rate as SampleRate);
+                    }
+                    asio_debug!(
+                        "'{}': {} sample rate(s) accepted by can_sample_rate",
+                        name,
+                        supported_sample_rates.len()
+                    );
+                    let supported_sample_rates = supported_sample_rates.into_boxed_slice();
 
                     self.current_driver = Some(driver);
 
