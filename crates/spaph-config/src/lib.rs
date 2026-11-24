@@ -3,6 +3,7 @@
 //! Precedence for every setting: CLI flag > config file > built-in default.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Name of the configuration file loaded automatically from the working directory.
@@ -171,6 +172,149 @@ pub fn parse_script(text: &str) -> Vec<ScriptLine> {
             }
         })
         .collect()
+}
+
+/// A parameter declared by a script with a `# param` header.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamDecl {
+    pub name: String,
+    /// `None` for a required parameter; `Some(value)` for an optional one (empty when `name=`).
+    pub default: Option<String>,
+}
+
+/// Parameter values, by name. Used both for the values a caller passes and the bound values.
+pub type ParamValues = BTreeMap<String, String>;
+
+fn is_param_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Read the `# param` headers of a script:
+/// `# param name` (required), `# param name=` (optional, empty when not given) or
+/// `# param name=value` (optional, `value` when not given).
+pub fn parse_param_headers(text: &str) -> Result<Vec<ParamDecl>, String> {
+    let mut decls: Vec<ParamDecl> = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let Some(rest) = raw.trim().strip_prefix('#') else { continue };
+        let spec = match rest.trim_start().strip_prefix("param") {
+            Some(s) if s.is_empty() || s.starts_with(char::is_whitespace) => s.trim(),
+            _ => continue,
+        };
+        let err = |msg: String| format!("line {}: {}", i + 1, msg);
+        if spec.is_empty() {
+            return Err(err("'# param' needs a name".into()));
+        }
+        let (name, default) = match spec.split_once('=') {
+            Some((name, default)) => (name.trim(), Some(default.trim().to_string())),
+            None => (spec, None),
+        };
+        if !is_param_name(name) {
+            return Err(err(format!("invalid parameter name '{}'", name)));
+        }
+        if decls.iter().any(|d| d.name == name) {
+            return Err(err(format!("parameter '{}' declared twice", name)));
+        }
+        decls.push(ParamDecl { name: name.to_string(), default });
+    }
+    Ok(decls)
+}
+
+/// Read the `name=value` arguments of a `load` call (already split into tokens).
+pub fn parse_param_args(tokens: &[String]) -> Result<ParamValues, String> {
+    let mut out = ParamValues::new();
+    for token in tokens {
+        let (name, value) = token
+            .split_once('=')
+            .ok_or_else(|| format!("expected name=value, got '{}'", token))?;
+        if !is_param_name(name) {
+            return Err(format!("invalid parameter name '{}'", name));
+        }
+        if out.insert(name.to_string(), value.to_string()).is_some() {
+            return Err(format!("parameter '{}' given twice", name));
+        }
+    }
+    Ok(out)
+}
+
+/// Check the caller's values against the declarations and fill in defaults.
+pub fn bind_params(decls: &[ParamDecl], given: &ParamValues) -> Result<ParamValues, String> {
+    if decls.is_empty() && !given.is_empty() {
+        return Err("this script takes no parameters".into());
+    }
+    if let Some(name) = given.keys().find(|k| !decls.iter().any(|d| &d.name == *k)) {
+        return Err(format!("unknown parameter '{}'", name));
+    }
+    let mut bound = ParamValues::new();
+    for decl in decls {
+        let value = match (given.get(&decl.name), &decl.default) {
+            (Some(v), _) => v.clone(),
+            (None, Some(default)) => default.clone(),
+            (None, None) => return Err(format!("missing required parameter '{}'", decl.name)),
+        };
+        bound.insert(decl.name.clone(), value);
+    }
+    Ok(bound)
+}
+
+/// Quote a value so it stays one argument after `split_args`. Values without spaces or
+/// quotes are left bare; an empty value becomes nothing at all.
+fn quote_value(value: &str) -> Result<String, String> {
+    if !value.chars().any(|c| c.is_whitespace() || c == '\'' || c == '"') {
+        Ok(value.to_string())
+    } else if !value.contains('\'') {
+        Ok(format!("'{}'", value))
+    } else if !value.contains('"') {
+        Ok(format!("\"{}\"", value))
+    } else {
+        Err(format!("value '{}' contains both ' and \" quotes", value))
+    }
+}
+
+/// Replace each `$name` in a script line with its bound value. A name ends at the first
+/// character that is not a letter, digit or `_`. A `$name` that is not declared is an error.
+pub fn substitute_params(line: &str, values: &ParamValues) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(pos) = rest.find('$') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let name = &after[..len];
+        if !is_param_name(name) {
+            out.push('$');
+            rest = after;
+            continue;
+        }
+        let value = values
+            .get(name)
+            .ok_or_else(|| format!("unknown parameter '${}'", name))?;
+        out.push_str(&quote_value(value)?);
+        rest = &after[len..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Commands of a script with its parameters bound. A script without `# param` headers is
+/// returned unchanged, and takes no parameters. All `$name` references are checked before
+/// any command is returned, so a bad call fails before the script runs.
+pub fn bind_script(text: &str, given: &ParamValues) -> Result<Vec<ScriptLine>, String> {
+    let decls = parse_param_headers(text)?;
+    let mut lines = parse_script(text);
+    if decls.is_empty() {
+        bind_params(&decls, given)?;
+        return Ok(lines);
+    }
+    let values = bind_params(&decls, given)?;
+    for line in lines.iter_mut() {
+        line.command = substitute_params(&line.command, &values)
+            .map_err(|e| format!("line {}: {}", line.line, e))?;
+    }
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -350,6 +494,178 @@ mod tests {
         std::fs::write(dir.join(DEFAULT_CONFIG_NAME), "{}").unwrap();
         assert_eq!(find_default_config(&dir), Some(dir.join(DEFAULT_CONFIG_NAME)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> ParamValues {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn param_headers_read_required_and_optional() {
+        let text = "# param alias\n# param device=\n# param midi=3\nplugin load x as $alias\n";
+        let decls = parse_param_headers(text).unwrap();
+        assert_eq!(
+            decls,
+            vec![
+                ParamDecl { name: "alias".into(), default: None },
+                ParamDecl { name: "device".into(), default: Some(String::new()) },
+                ParamDecl { name: "midi".into(), default: Some("3".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn param_header_ignores_spaces_around_equals() {
+        let decls = parse_param_headers("# param plugin_name= amsynth\n# param midi =  2\n").unwrap();
+        assert_eq!(
+            decls,
+            vec![
+                ParamDecl { name: "plugin_name".into(), default: Some("amsynth".into()) },
+                ParamDecl { name: "midi".into(), default: Some("2".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn param_header_needs_a_name() {
+        assert!(parse_param_headers("# param\n").unwrap_err().contains("needs a name"));
+        assert!(parse_param_headers("# param 1x\n").unwrap_err().contains("invalid parameter name"));
+        assert!(parse_param_headers("# param a b\n").unwrap_err().contains("invalid parameter name"));
+    }
+
+    #[test]
+    fn param_header_declared_twice_is_rejected() {
+        let err = parse_param_headers("# param a\n# param a=\n").unwrap_err();
+        assert!(err.contains("declared twice"), "{err}");
+    }
+
+    #[test]
+    fn plain_comments_are_not_param_headers() {
+        assert_eq!(parse_param_headers("# parameters are cool\n# note\n").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn param_args_split_on_first_equals() {
+        let tokens = vec!["alias=strum2".to_string(), "device=Scarlett Solo".to_string(), "x=a=b".to_string()];
+        assert_eq!(
+            parse_param_args(&tokens).unwrap(),
+            params(&[("alias", "strum2"), ("device", "Scarlett Solo"), ("x", "a=b")])
+        );
+    }
+
+    #[test]
+    fn param_args_must_be_named() {
+        let err = parse_param_args(&["strum2".to_string()]).unwrap_err();
+        assert!(err.contains("expected name=value"), "{err}");
+        let err = parse_param_args(&["1x=2".to_string()]).unwrap_err();
+        assert!(err.contains("invalid parameter name"), "{err}");
+    }
+
+    #[test]
+    fn param_args_given_twice_is_rejected() {
+        let tokens = vec!["a=1".to_string(), "a=2".to_string()];
+        assert!(parse_param_args(&tokens).unwrap_err().contains("given twice"));
+    }
+
+    #[test]
+    fn bind_requires_required_params() {
+        let decls = parse_param_headers("# param alias\n").unwrap();
+        let err = bind_params(&decls, &ParamValues::new()).unwrap_err();
+        assert!(err.contains("missing required parameter 'alias'"), "{err}");
+    }
+
+    #[test]
+    fn bind_fills_defaults() {
+        let decls = parse_param_headers("# param a\n# param b=\n# param c=7\n").unwrap();
+        let bound = bind_params(&decls, &params(&[("a", "1")])).unwrap();
+        assert_eq!(bound, params(&[("a", "1"), ("b", ""), ("c", "7")]));
+    }
+
+    #[test]
+    fn bind_rejects_undeclared_param() {
+        let decls = parse_param_headers("# param a\n").unwrap();
+        let err = bind_params(&decls, &params(&[("a", "1"), ("typo", "2")])).unwrap_err();
+        assert!(err.contains("unknown parameter 'typo'"), "{err}");
+    }
+
+    #[test]
+    fn bind_rejects_params_for_script_without_headers() {
+        let err = bind_params(&[], &params(&[("a", "1")])).unwrap_err();
+        assert!(err.contains("takes no parameters"), "{err}");
+    }
+
+    #[test]
+    fn substitute_replaces_names() {
+        let values = params(&[("alias", "strum2"), ("midi", "2")]);
+        assert_eq!(
+            substitute_params("midi connect 0 $alias $midi", &values).unwrap(),
+            "midi connect 0 strum2 2"
+        );
+    }
+
+    #[test]
+    fn substitute_empty_value_disappears() {
+        let values = params(&[("midi", "")]);
+        assert_eq!(substitute_params("midi connect 0 strum $midi", &values).unwrap(), "midi connect 0 strum ");
+        let tokens = split_args_for_test(&substitute_params("midi connect 0 strum $midi", &values).unwrap());
+        assert_eq!(tokens, vec!["midi", "connect", "0", "strum"]);
+    }
+
+    #[test]
+    fn substitute_quotes_values_with_spaces() {
+        let values = params(&[("device", "Scarlett Solo USB")]);
+        let line = substitute_params("audio connect strum $device", &values).unwrap();
+        assert_eq!(line, "audio connect strum 'Scarlett Solo USB'");
+    }
+
+    #[test]
+    fn substitute_uses_double_quotes_when_value_has_single_quote() {
+        let values = params(&[("name", "it's a synth")]);
+        let line = substitute_params("plugin load x as $name", &values).unwrap();
+        assert_eq!(line, "plugin load x as \"it's a synth\"");
+    }
+
+    #[test]
+    fn substitute_rejects_value_with_both_quote_kinds() {
+        let values = params(&[("name", "it's \"x\"")]);
+        assert!(substitute_params("plugin load x as $name", &values).is_err());
+    }
+
+    #[test]
+    fn substitute_rejects_undeclared_name() {
+        let err = substitute_params("midi connect 0 $nope", &ParamValues::new()).unwrap_err();
+        assert!(err.contains("unknown parameter '$nope'"), "{err}");
+    }
+
+    #[test]
+    fn substitute_leaves_lone_dollar_alone() {
+        assert_eq!(substitute_params("cost $ 5 $1", &ParamValues::new()).unwrap(), "cost $ 5 $1");
+    }
+
+    #[test]
+    fn bind_script_without_headers_is_unchanged() {
+        let lines = bind_script("master $x\n", &ParamValues::new()).unwrap();
+        assert_eq!(lines, vec![ScriptLine { line: 1, command: "master $x".into() }]);
+    }
+
+    #[test]
+    fn bind_script_substitutes_each_line() {
+        let text = "# param level\n\nmaster $level\n";
+        let lines = bind_script(text, &params(&[("level", "0.5")])).unwrap();
+        assert_eq!(lines, vec![ScriptLine { line: 3, command: "master 0.5".into() }]);
+    }
+
+    #[test]
+    fn bind_script_reports_undeclared_reference_with_line() {
+        let text = "# param a\nmaster $a\nmaster $b\n";
+        let err = bind_script(text, &params(&[("a", "1")])).unwrap_err();
+        assert!(err.starts_with("line 3:"), "{err}");
+        assert!(err.contains("unknown parameter '$b'"), "{err}");
+    }
+
+    /// Whitespace split, enough for lines without quotes.
+    fn split_args_for_test(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
     }
 
     #[test]

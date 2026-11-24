@@ -456,6 +456,126 @@ fn script_flag_is_restored_after_load() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Run a parent script that calls `child.spaph` with `call`, and return the outcome.
+fn run_load_with_params(name: &str, child: &str, call: &str) -> (Option<i32>, String, String) {
+    let dir = scratch(name);
+    std::fs::write(dir.join("child.spaph"), child).unwrap();
+    std::fs::write(dir.join("s.spaph"), format!("load child.spaph {}\n", call)).unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn load_passes_parameter_to_script() {
+    let (code, text, err) = run_load_with_params("parampass", "# param level\nmaster $level\n", "level=0.4");
+    assert_eq!(code, Some(0), "{err}");
+    assert!(text.contains("master volume set to 0.4"), "{text}");
+}
+
+#[test]
+fn load_quoted_parameter_stays_one_argument() {
+    // split_args removes the quotes; the value keeps its space, so the alias check sees it whole.
+    let (code, _, err) = run_load_with_params(
+        "paramquote",
+        "# param name\nplugin load /no/such.so as $name\n",
+        "name='a b'",
+    );
+    assert_eq!(code, Some(1));
+    assert!(err.contains("invalid alias 'a b'"), "{err}");
+}
+
+#[test]
+fn load_missing_required_parameter_stops_before_running() {
+    let (code, text, err) = run_load_with_params(
+        "parammiss",
+        "master 0.9\n# param level\nmaster $level\n",
+        "",
+    );
+    assert_eq!(code, Some(1));
+    assert!(err.contains("missing required parameter 'level'"), "{err}");
+    assert!(!text.contains("0.9"), "no command may run when binding fails: {text}");
+}
+
+#[test]
+fn load_undeclared_parameter_is_rejected() {
+    let (code, _, err) = run_load_with_params("paramtypo", "# param level\nmaster $level\n", "level=0.4 lvl=1");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("unknown parameter 'lvl'"), "{err}");
+}
+
+#[test]
+fn load_undeclared_reference_in_script_is_rejected_at_load() {
+    let (code, text, err) = run_load_with_params(
+        "paramref",
+        "# param level\nmaster $level\nmaster $lvl\n",
+        "level=0.4",
+    );
+    assert_eq!(code, Some(1));
+    assert!(err.contains("line 3") && err.contains("unknown parameter '$lvl'"), "{err}");
+    assert!(!text.contains("master volume set to 0.4"), "no command may run: {text}");
+}
+
+#[test]
+fn load_parameters_to_script_without_headers_is_rejected() {
+    let (code, _, err) = run_load_with_params("paramnone", "master 0.2\n", "level=0.4");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("takes no parameters"), "{err}");
+}
+
+#[test]
+fn load_duplicate_parameter_is_rejected() {
+    let (code, _, err) = run_load_with_params("paramdup", "# param level\nmaster $level\n", "level=0.1 level=0.2");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("given twice"), "{err}");
+}
+
+#[test]
+fn load_optional_parameter_takes_its_default() {
+    let (code, text, err) = run_load_with_params("paramdef", "# param level=0.3\nmaster $level\n", "");
+    assert_eq!(code, Some(0), "{err}");
+    assert!(text.contains("master volume set to 0.3"), "{text}");
+}
+
+#[test]
+fn two_instances_of_one_script_get_their_own_alias() {
+    let plugin = "/usr/lib/vst/amsynth_vst.so";
+    if !std::path::Path::new(plugin).exists() {
+        eprintln!("skipped: {plugin} not installed");
+        return;
+    }
+    let dir = scratch("twoinst");
+    std::fs::write(
+        dir.join("synth.spaph"),
+        format!("# param alias\n# param midi=\nplugin load {plugin} as $alias\nplugin list\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("s.spaph"),
+        "load synth.spaph alias=synth1\nload synth.spaph alias=synth2\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("c.json"), r#"{ "script": "s.spaph" }"#).unwrap();
+    let out = spaph()
+        .args(["--config", dir.join("c.json").to_str().unwrap(), "--osc-port", "0"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("as synth1"), "{text}");
+    assert!(text.contains("as synth2"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn run_script_text(name: &str, text: &str) -> (Option<i32>, String, String) {
     let dir = scratch(name);
     std::fs::write(dir.join("s.spaph"), text).unwrap();

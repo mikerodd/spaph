@@ -138,6 +138,37 @@ fn resolve_plugin_arg(token: &str) -> Option<u32> {
     manager().lock().unwrap().resolve(token)
 }
 
+/// Pick a device from `names`: a numeric token is an index from `audio list`; any other token
+/// must be part of exactly one device name (case-insensitive).
+fn match_device(token: &str, names: &[String]) -> std::result::Result<usize, String> {
+    if let Ok(i) = token.parse::<usize>() {
+        return Ok(i);
+    }
+    let needle = token.to_lowercase();
+    let hits: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [i] => Ok(*i),
+        [] => Err(format!("no audio device matches '{}'", token)),
+        _ => {
+            let list: Vec<String> = hits.iter().map(|&i| format!("[{}] {}", i, names[i])).collect();
+            Err(format!("audio device '{}' matches more than one device: {}", token, list.join(", ")))
+        }
+    }
+}
+
+fn resolve_device_arg(token: &str) -> std::result::Result<usize, String> {
+    if let Ok(i) = token.parse::<usize>() {
+        return Ok(i);
+    }
+    let names = spaph_audio::list_devices().map_err(|e| e.to_string())?;
+    match_device(token, &names)
+}
+
 fn load_plugin(path: &PathBuf, alias: Option<&str>) -> Result<()> {
     tracing::info!("load: calling plugin loader for {}", path.display());
     let id = manager().lock().unwrap().load_as(path, alias)?;
@@ -186,7 +217,7 @@ fn print_help() {
     println!("  volume [<id>] <level>         Set host-side output gain (per plugin)");
     println!("  master <level>                Set master output gain");
     println!("  disconnect                    Stop all audio and MIDI connections");
-    println!("  load <script>                 Run a script file (relative to the config file folder)");
+    println!("  load <script> [name=value...] Run a script file (relative to the config file folder), passing its parameters");
     println!("  quit | exit                   Exit the shell");
 }
 
@@ -1227,7 +1258,16 @@ fn run_line(line: &str) -> bool {
                         if parts.len() < 3 {
                             cmd_err!("usage: audio connect <plugin_id> [device_index]");
                         } else if let Some(pid) = resolve_plugin_arg(&parts[2]) {
-                            let dev_idx = parts.get(3).and_then(|s| s.parse::<usize>().ok());
+                            let dev_idx = match parts.get(3) {
+                                Some(token) => match resolve_device_arg(token) {
+                                    Ok(i) => Some(i),
+                                    Err(e) => {
+                                        cmd_err!("{}", e);
+                                        return true;
+                                    }
+                                },
+                                None => None,
+                            };
                             let mgr = manager().lock().unwrap();
                             let inst = mgr.get_instance(pid);
                             let q = mgr.get_midi_queue(pid);
@@ -1336,20 +1376,25 @@ fn run_line(line: &str) -> bool {
             } else if LOAD_DEPTH.load(Ordering::Relaxed) >= MAX_LOAD_DEPTH {
                 cmd_err!("load: scripts nested too deep (max {})", MAX_LOAD_DEPTH);
             } else {
-                let base = CONFIG_DIR.get().and_then(|d| d.as_deref());
-                let cfg = spaph_config::Config { script: Some(PathBuf::from(&parts[1])), ..Default::default() };
-                match spaph_config::resolve_script(&cfg, base) {
-                    Some(path) => {
-                        LOAD_DEPTH.fetch_add(1, Ordering::Relaxed);
-                        let result = run_script(&path);
-                        LOAD_DEPTH.fetch_sub(1, Ordering::Relaxed);
-                        // A failing line in the loaded script is an error of this command too,
-                        // so the calling script stops as well.
-                        if let Err(msg) = result {
-                            cmd_err!("load {}: {}", parts[1], msg);
+                match spaph_config::parse_param_args(&parts[2..]) {
+                    Err(e) => cmd_err!("load {}: {}", parts[1], e),
+                    Ok(params) => {
+                        let base = CONFIG_DIR.get().and_then(|d| d.as_deref());
+                        let cfg = spaph_config::Config { script: Some(PathBuf::from(&parts[1])), ..Default::default() };
+                        match spaph_config::resolve_script(&cfg, base) {
+                            Some(path) => {
+                                LOAD_DEPTH.fetch_add(1, Ordering::Relaxed);
+                                let result = run_script(&path, &params);
+                                LOAD_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                                // A failing line in the loaded script is an error of this command too,
+                                // so the calling script stops as well.
+                                if let Err(msg) = result {
+                                    cmd_err!("load {}: {}", parts[1], msg);
+                                }
+                            }
+                            None => cmd_err!("usage: load <script>"),
                         }
                     }
-                    None => cmd_err!("usage: load <script>"),
                 }
             }
         }
@@ -1536,12 +1581,15 @@ fn init_logging(level: &str) {
 
 /// Run a script line by line. Stops at the first failing command (returns its location),
 /// and `quit` ends the script without ending the program.
-fn run_script(path: &Path) -> std::result::Result<(), String> {
+fn run_script(path: &Path, params: &spaph_config::ParamValues) -> std::result::Result<(), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read script {}: {}", path.display(), e))?;
+    // Parameters are checked and substituted before the first command runs.
+    let lines = spaph_config::bind_script(&text, params)
+        .map_err(|e| format!("script {}: {}", path.display(), e))?;
     let was_in_script = IN_SCRIPT.swap(true, Ordering::Relaxed);
     let mut result = Ok(());
-    for ScriptLine { line, command } in spaph_config::parse_script(&text) {
+    for ScriptLine { line, command } in lines {
         CMD_ERROR.store(false, Ordering::Relaxed);
         let keep_going = run_line(&command);
         if CMD_ERROR.load(Ordering::Relaxed) {
@@ -1654,7 +1702,7 @@ fn main() {
         config_path.as_deref().and_then(|p| p.parent()),
     );
     if let Some(script) = script {
-        if let Err(msg) = run_script(&script) {
+        if let Err(msg) = run_script(&script, &spaph_config::ParamValues::new()) {
             eprintln!("error: {}", msg);
             shutdown(1);
         }
@@ -1670,7 +1718,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_quit_command, midi_channel_of, midi_matches, parse_midi_channel, split_args};
+    use super::{is_quit_command, match_device, midi_channel_of, midi_matches, parse_midi_channel, split_args};
 
     #[test]
     fn quit_detected_as_first_word() {
@@ -1776,5 +1824,33 @@ mod tests {
         assert!(parse_midi_channel("17").is_err());
         assert!(parse_midi_channel("abc").is_err());
         assert!(parse_midi_channel("").is_err());
+    }
+
+    #[test]
+    fn match_device_by_index_needs_no_name() {
+        assert_eq!(match_device("1", &[]).unwrap(), 1);
+    }
+
+    #[test]
+    fn match_device_by_partial_name_ignores_case() {
+        let names = vec![
+            "Speakers (Realtek)".to_string(),
+            "Haut-parleurs (Scarlett Solo USB)".to_string(),
+        ];
+        assert_eq!(match_device("scarlett solo", &names).unwrap(), 1);
+    }
+
+    #[test]
+    fn match_device_unknown_name_is_an_error() {
+        let names = vec!["Speakers (Realtek)".to_string()];
+        assert!(match_device("Scarlett", &names).unwrap_err().contains("no audio device matches"));
+    }
+
+    #[test]
+    fn match_device_ambiguous_name_lists_candidates() {
+        let names = vec!["USB Audio A".to_string(), "USB Audio B".to_string()];
+        let err = match_device("usb", &names).unwrap_err();
+        assert!(err.contains("more than one device"), "{err}");
+        assert!(err.contains("[0] USB Audio A") && err.contains("[1] USB Audio B"), "{err}");
     }
 }
