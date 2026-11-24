@@ -37,3 +37,6 @@ spaph-vst3 = { path = "crates/spaph-vst3" }
 spaph-audio = { path = "crates/spaph-audio" }
 spaph-osc = { path = "crates/spaph-osc" }
 spaph-midi = { path = "crates/spaph-midi" }
+
+[patch.crates-io]
+vst3-host = { path = "third_party/vst3-host" }
