@@ -3173,8 +3173,7 @@ impl PluginInternal for PluginImpl {
                 // Offer the current scale factor before querying the size: zoom-capable views
                 // (e.g. Kontakt) report no size until a content scale has been set. A decline
                 // never decides whether the editor opens.
-                let scale_result = set_view_scale_factor(&view, self.editor_scale_factor);
-                eprintln!("DIAG scale factor {:?} -> {:?}", self.editor_scale_factor, scale_result);
+                let _ = set_view_scale_factor(&view, self.editor_scale_factor);
 
                 // Hand the plugin an IPlugFrame (before attach, per the SDK) so it can
                 // request host-side resizes; requests land in `editor_resize`.
@@ -3182,7 +3181,6 @@ impl PluginInternal for PluginImpl {
                     Error::Other("Failed to create editor plug frame".to_string())
                 })?;
                 let frame_result = view.setFrame(frame.as_ptr());
-                eprintln!("DIAG setFrame -> {frame_result:#x}");
                 if frame_result != kResultOk && frame_result != kResultTrue {
                     return Err(Error::Other(format!(
                         "Plugin rejected editor plug frame: {frame_result:#x}"
@@ -3197,18 +3195,8 @@ impl PluginInternal for PluginImpl {
                     bottom: 300,
                 };
 
-                let size_result = view.getSize(&mut view_rect);
-                eprintln!(
-                    "DIAG getSize -> {size_result:#x} rect {}x{} (l={} t={} r={} b={})",
-                    view_rect.right - view_rect.left,
-                    view_rect.bottom - view_rect.top,
-                    view_rect.left,
-                    view_rect.top,
-                    view_rect.right,
-                    view_rect.bottom
-                );
-                if size_result != kResultOk {
-                    eprintln!("DIAG getSize failed; attaching with default rect");
+                if view.getSize(&mut view_rect) != kResultOk {
+                    // Some plugins (e.g. Kontakt) reject the size query; attach with the default.
                     view_rect = ViewRect {
                         left: 0,
                         top: 0,
