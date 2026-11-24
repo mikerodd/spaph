@@ -3208,7 +3208,13 @@ impl PluginInternal for PluginImpl {
                     view_rect.bottom
                 );
                 if size_result != kResultOk {
-                    return Err(Error::Other("Failed to get view size".to_string()));
+                    eprintln!("DIAG getSize failed; attaching with default rect");
+                    view_rect = ViewRect {
+                        left: 0,
+                        top: 0,
+                        right: 400,
+                        bottom: 300,
+                    };
                 }
                 view_rect_size(&view_rect)?;
 
