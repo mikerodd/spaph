@@ -29,7 +29,10 @@ static SAMPLE_RATE: Mutex<u32> = Mutex::new(48000);
 static BUFFER_SIZE: Mutex<usize> = Mutex::new(512);
 static DEVICE_INDEX: Mutex<Option<usize>> = Mutex::new(None);
 
-pub fn set_sample_rate(v: u32) { *SAMPLE_RATE.lock().unwrap() = v; }
+pub fn set_sample_rate(v: u32) {
+    *SAMPLE_RATE.lock().unwrap() = v;
+    spaph_backing::set_output_rate(v);
+}
 pub fn get_sample_rate() -> u32 { *SAMPLE_RATE.lock().unwrap() }
 pub fn set_buffer_size(v: usize) { *BUFFER_SIZE.lock().unwrap() = if v == 0 { 512 } else { v }; }
 pub fn get_buffer_size() -> usize { *BUFFER_SIZE.lock().unwrap() }
@@ -537,6 +540,8 @@ pub fn start_stream() -> Result<()> {
                 }
             }
         }
+        // The backing track is added after the plugins, into the same block.
+        spaph_backing::mix_into(data, channels_c);
     };
     let render: Render = Arc::new(render);
 

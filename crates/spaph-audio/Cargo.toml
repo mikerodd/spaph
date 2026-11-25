@@ -13,6 +13,7 @@ asio = ["cpal/asio"]
 [dependencies]
 spaph-types = { workspace = true }
 spaph-plugin = { workspace = true }
+spaph-backing = { workspace = true }
 cpal = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

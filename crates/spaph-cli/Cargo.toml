@@ -17,6 +17,7 @@ spaph-vst2 = { workspace = true }
 spaph-vst3 = { workspace = true }
 spaph-midi = { workspace = true }
 spaph-audio = { workspace = true }
+spaph-backing = { workspace = true }
 spaph-osc = { workspace = true }
 spaph-config = { workspace = true }
 clap = { workspace = true }

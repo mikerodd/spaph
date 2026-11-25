@@ -1,0 +1,12 @@
+[package]
+name = "spaph-backing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+spaph-types = { workspace = true }
+symphonia = { workspace = true }
+rubato = { workspace = true }
+tracing = { workspace = true }

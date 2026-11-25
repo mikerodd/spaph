@@ -49,6 +49,8 @@ pub struct Config {
     pub log_level: Option<String>,
     /// Path to a script of CLI commands run at startup (relative to the config file).
     pub script: Option<PathBuf>,
+    /// Folder holding backing tracks for `backing load` (relative to the config file).
+    pub backing_dir: Option<PathBuf>,
 }
 
 /// Values given on the command line; `Some` overrides the config file.
@@ -135,6 +137,18 @@ pub fn apply_overrides(cfg: &mut Config, o: &Overrides) -> Result<(), ConfigErro
         cfg.log_level = Some(level.clone());
     }
     Ok(())
+}
+
+/// Resolve the backing-track folder: relative paths are taken from the config file's folder.
+pub fn resolve_backing_dir(cfg: &Config, config_dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = cfg.backing_dir.as_ref()?;
+    if dir.is_absolute() {
+        return Some(dir.clone());
+    }
+    Some(match config_dir {
+        Some(base) => base.join(dir),
+        None => dir.clone(),
+    })
 }
 
 /// Resolve the script path: relative paths are taken from the config file's folder.

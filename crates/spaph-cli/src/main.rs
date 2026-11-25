@@ -1398,6 +1398,7 @@ fn run_line(line: &str) -> bool {
                 }
             }
         }
+        "backing" => backing_command(&parts),
         "quit" | "exit" => {
             return false;
         }
@@ -1406,6 +1407,61 @@ fn run_line(line: &str) -> bool {
     true
 }
 
+
+/// `backing` commands: play a stereo file from `backing_dir` alongside the plugins.
+///
+/// `backing load <name>`, `play`, `pause`, `stop`, `begin`, `unload`, `seek <+/-seconds>`,
+/// `volume <dB>` (absolute) or `volume <+dB/-dB>` (relative), and `backing` alone for status.
+fn backing_command(parts: &[String]) {
+    use spaph_types::SpaphError;
+    let name = || parts[2..].join(" ");
+    let result: spaph_types::Result<()> = match parts.get(1).map(String::as_str) {
+        None => {
+            let st = spaph_backing::status();
+            println!(
+                "backing: {} | {:?} | {:.1} s | {:+.1} dB",
+                st.file.as_deref().unwrap_or("(none)"),
+                st.state,
+                st.position_secs,
+                st.volume_db
+            );
+            Ok(())
+        }
+        Some("load") if parts.len() >= 3 => spaph_backing::load(&name()),
+        Some("unload") => {
+            spaph_backing::unload();
+            Ok(())
+        }
+        Some("play") => spaph_backing::play(),
+        Some("pause") => {
+            spaph_backing::pause();
+            Ok(())
+        }
+        Some("stop") => spaph_backing::stop(),
+        Some("begin") => spaph_backing::begin(),
+        Some("seek") if parts.len() == 3 => match parts[2].parse::<f64>() {
+            Ok(secs) => spaph_backing::seek_relative(secs),
+            Err(_) => Err(SpaphError::Audio(format!("seek: not a number: {}", parts[2]))),
+        },
+        Some("volume") if parts.len() == 3 => match parts[2].parse::<f32>() {
+            Ok(db) if parts[2].starts_with(['+', '-']) => {
+                spaph_backing::change_volume_db(db);
+                Ok(())
+            }
+            Ok(db) => {
+                spaph_backing::set_volume_db(db);
+                Ok(())
+            }
+            Err(_) => Err(SpaphError::Audio(format!("volume: not a number: {}", parts[2]))),
+        },
+        _ => Err(SpaphError::Audio(
+            "usage: backing [load <name> | play | pause | stop | begin | unload | seek <s> | volume <dB>]".into(),
+        )),
+    };
+    if let Err(e) = result {
+        cmd_err!("backing: {}", e);
+    }
+}
 
 /// Block until the main thread acknowledges the last command. Returns `false` if the
 /// session is ending (ack channel closed or stop requested), so the caller should exit.
@@ -1696,6 +1752,12 @@ fn main() {
         d.buffer_size = cfg.audio.buffer_size;
         d.device_index = cfg.audio.device_index;
     }
+
+    let config_dir = config_path.as_deref().and_then(|p| p.parent());
+    if let Some(rate) = cfg.audio.sample_rate {
+        spaph_backing::set_output_rate(rate);
+    }
+    spaph_backing::set_backing_dir(spaph_config::resolve_backing_dir(&cfg, config_dir));
 
     let script = spaph_config::resolve_script(
         &cfg,
