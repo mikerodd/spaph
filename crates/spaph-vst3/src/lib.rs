@@ -23,6 +23,11 @@ pub fn keep_active(s: f32) -> f32 {
     if s == 0.0 { SILENCE_FLOOR } else { s }
 }
 
+/// Rate and block size the plugin is set up with at load. spaph's default stream rate, so the
+/// usual case needs no reconfigure; other rates are applied in `apply_setup`.
+const LOAD_SAMPLE_RATE: f64 = 48000.0;
+const LOAD_BLOCK_SIZE: usize = 512;
+
 pub struct Vst3Factory;
 
 impl PluginFactory for Vst3Factory {
@@ -37,7 +42,8 @@ impl PluginFactory for Vst3Factory {
         }
     }
     fn load(&self, path: &Path) -> Result<Box<dyn SpaphPluginInstance>> {
-        let plugin = simple::load_plugin(path).map_err(|e| SpaphError::Plugin(e.to_string()))?;
+        let plugin = simple::load_plugin_with_settings(path, LOAD_SAMPLE_RATE, LOAD_BLOCK_SIZE)
+            .map_err(|e| SpaphError::Plugin(e.to_string()))?;
         let vi = plugin.info().clone();
         // `vi.audio_inputs` / `audio_outputs` count buses, not channels. Use the channel count
         // of the main (first active) bus instead, falling back to the bus counts.
@@ -91,7 +97,9 @@ impl PluginFactory for Vst3Factory {
             info,
             plugin,
             presets_map,
-            sample_rate: 48000.0,
+            sample_rate: LOAD_SAMPLE_RATE,
+            block_size: LOAD_BLOCK_SIZE,
+            applied: (LOAD_SAMPLE_RATE, LOAD_BLOCK_SIZE),
         }))
     }
 }
@@ -101,6 +109,45 @@ pub struct Vst3Instance {
     plugin: std::sync::Arc<std::sync::Mutex<Vst3Plugin>>,
     presets_map: Vec<(i32, i32)>,
     sample_rate: f64,
+    block_size: usize,
+    /// The (sample rate, block size) the plugin's processing setup currently uses.
+    applied: (f64, usize),
+}
+
+impl Vst3Instance {
+    /// Make the plugin's processing setup match the requested rate and block size.
+    ///
+    /// A plugin keeps the rate it was set up with, so when spaph's stream runs at another
+    /// rate the plugin must be reconfigured, or it renders at the wrong speed and pitch.
+    fn apply_setup(&mut self) {
+        let wanted = (self.sample_rate, self.block_size);
+        if self.applied == wanted {
+            return;
+        }
+        let mut plugin = self.plugin.lock().unwrap();
+        let was_processing = plugin.is_processing();
+        if was_processing {
+            if let Err(e) = plugin.stop_processing() {
+                tracing::warn!("VST3 stop before reconfigure failed: {e}");
+            }
+        }
+        match plugin.reconfigure(wanted.0, wanted.1) {
+            Ok(()) => {
+                tracing::info!("VST3 reconfigured to {} Hz, {} frames", wanted.0, wanted.1);
+                self.applied = wanted;
+            }
+            Err(e) => tracing::error!(
+                "VST3 reconfigure to {} Hz, {} frames failed: {e}",
+                wanted.0,
+                wanted.1
+            ),
+        }
+        if was_processing {
+            if let Err(e) = plugin.start_processing() {
+                tracing::error!("VST3 restart after reconfigure failed: {e}");
+            }
+        }
+    }
 }
 
 unsafe impl Send for Vst3Instance {}
@@ -143,6 +190,11 @@ impl SpaphPluginInstance for Vst3Instance {
     }
     fn set_sample_rate(&mut self, sr: f64) {
         self.sample_rate = sr;
+        self.apply_setup();
+    }
+    fn set_block_size(&mut self, n: usize) {
+        self.block_size = n.max(LOAD_BLOCK_SIZE);
+        self.apply_setup();
     }
     fn init(&mut self) {
         let _ = self.plugin.lock().unwrap().start_processing();
